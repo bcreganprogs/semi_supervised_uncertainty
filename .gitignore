@@ -1,0 +1,11 @@
+/data
+/__pycache__
+/lightning_logs
+/wandb
+/models/__pycache__
+/data_handling/__pycache__
+/nn_unet_data
+/bash_scripts
+/utils/__pycache__
+/runs
+/models/mae/__pycache__

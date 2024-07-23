@@ -2,29 +2,8 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-# def build_grid(resolution):
-#     ranges = [np.linspace(0., 1., num=res) for res in resolution]
-#     grid = np.meshgrid(*ranges, sparse=False, indexing="ij")
-#     grid = np.stack(grid, axis=-1)
-#     grid = np.reshape(grid, [resolution[0], resolution[1], -1])
-#     grid = np.expand_dims(grid, axis=0)
-#     grid = grid.astype(np.float32)
-#     return torch.from_numpy(np.concatenate([grid, 1.0 - grid], axis=-1)).to('cuda:0')
+from utils.utils import SoftPositionEmbed
     
-# class SoftPositionEmbed(nn.Module):
-#     def __init__(self, hidden_size, resolution):
-#         """Builds the soft position embedding layer.
-#         Args:
-#         hidden_size: Size of input feature dimension.
-#         resolution: Tuple of integers specifying width and height of grid.
-#         """
-#         super().__init__()
-#         self.embedding = nn.Linear(4, hidden_size, bias=True)
-#         self.grid = build_grid(resolution)
-
-#     def forward(self, inputs):
-#         grid = self.embedding(self.grid)
-#         return inputs + grid
 
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
@@ -34,9 +13,6 @@ class ConvBlock(nn.Module):
             nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
             nn.BatchNorm2d(out_channels),
             nn.ReLU(),
-            nn.Conv2d(out_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU()
         )
 
     def forward(self, x):
@@ -46,105 +22,183 @@ class Upsample(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(Upsample, self).__init__()
 
-        self.upsample = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
-        self.upsample_y = nn.ConvTranspose2d(in_channels, in_channels // 2, kernel_size=2, stride=2)
-        self.conv = ConvBlock(out_channels, out_channels)
+        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.conv = ConvBlock(in_channels, out_channels)
 
     def forward(self, x):
-
-        # x is from last layer y is skip connection
-
         x = self.upsample(x)
-        # y = self.upsample_y(y)
-
-        # diffY = y.size()[2] - x.size()[2]
-        # diffX = y.size()[3] - x.size()[3]
-
-        # x = F.pad(x, (diffX // 2, diffX - diffX // 2,
-        #               diffY // 2, diffY - diffY // 2))
-        # x = torch.cat([y, x], dim=1)
         x = self.conv(x)
-
         return x
+    
+class Downsample(nn.Module):
+    def __init__(self, in_channels, out_channels):
+        super(Downsample, self).__init__()
+
+        self.downsample = nn.Sequential(
+            ConvBlock(in_channels, out_channels),
+            nn.MaxPool2d(2)            
+        )
+
+    def forward(self, x):
+        return self.downsample(x)
+    
+class CNNEncoder(nn.Module):
+    """CNN Encoder to transform image to feature embeddings.	"""
+    def __init__(self, slot_dim, num_channels=1):
+        self.slot_dim = slot_dim
+        self.num_channels = num_channels
+
+        self.conv1 = ConvBlock(num_channels, 16) 
+        self.conv2 = Downsample(16, 32)
+        self.conv3 = Downsample(32, 64)
+        self.conv4 = Downsample(64, 128)
+        self.conv5 = Downsample(128, 256)
+        self.conv6 = Downsample(256, 512)
+        self.conv7 = Downsample(512, 512)
+
+
 
 class Decoder(nn.Module):
     """Decoder to transform each slot to a 2D feature map."""
-    def __init__(self, slot_dim, num_slots):
-        super().__init__()
-        self.slot_dim = slot_dim
-        #self.num_classes = num_classes
-        
-        self.fc = nn.Linear(self.slot_dim, self.slot_dim * 4 * 4)
-        self.conv1 = Upsample(self.slot_dim, 512)
-        self.conv2 = Upsample(512, 256)
-        self.conv3 = Upsample(256, 128)
-        self.conv4 = Upsample(128, 64)
-        self.conv5 = Upsample(64, 32)
-        self.conv6 = Upsample(32, 16)
-        self.conv7 = nn.Conv2d(16, 1, kernel_size=33, padding=0)
-
-    def forward(self, x):
-        # input, x has shape (batch_size, num_slots, slot_dim)
-        batch_size, num_slots, slot_dim = x.size()
-
-        x = self.fc(x)
-        x = x.view(batch_size * num_slots, self.slot_dim, 4, 4)
-        x = self.conv1(x)   # (batch_size * num_slots, 512, 8, 8)
-        x = self.conv2(x)   # (batch_size * num_slots, 256, 16, 16)
-        x = self.conv3(x)   # (batch_size * num_slots, 128, 32, 32)
-        x = self.conv4(x)   # (batch_size * num_slots, 64, 64, 64)
-        x = self.conv5(x)   # (batch_size * num_slots, 32, 128, 128)
-        x = self.conv6(x)   # (batch_size * num_slots, 16, 256, 256)
-        x = self.conv7(x)   # (batch_size * num_slots, 1, 224, 224)
-
-        x = x.view(batch_size, num_slots, 224, 224)
-
-        return x
-
-class SlotReshape(nn.Module):
-    def __init__(self, slot_dim, num_slots):
+    def __init__(self, slot_dim, num_slots, num_classes, num_channels=1, initial_size=(8, 8)):
         super().__init__()
         self.slot_dim = slot_dim
         self.num_slots = num_slots
+        self.num_classes = num_classes
+        self.num_channels = num_channels
+
+        self.decoder_initial_size = initial_size
+        self.decoder_pos_embeddings = SoftPositionEmbed(slot_dim, self.decoder_initial_size)
+        
+        self.conv1 = Upsample(slot_dim, 256)
+        self.mid_downsample = nn.Conv2d(256, 256, kernel_size=3, padding=0)
+        self.conv2 = Upsample(256, 128)
+        self.conv3 = Upsample(128, 128)
+        self.conv4 = ConvBlock(128, 64)
+        self.conv5 = Upsample(64, 32)
+        self.conv6 = Upsample(32, 16)
+        self.end_conv = nn.Conv2d(16, num_channels + 1, kernel_size=3, padding=1)
+
+        self.final_conv = nn.Sequential(
+            #nn.BatchNorm2d(num_slots),
+            nn.Conv2d(num_slots, num_classes, kernel_size=1)
+        )
+
 
     def forward(self, x):
-        batch_size, _ = x.shape
-        return x.view(batch_size, self.slot_dim, 4, 4)
+        # input, x has shape (batch_size * num_slots, init_height, init_width, slot_dim)
+   
+        #x = self.decoder_pos_embeddings(x)   # (batch_size * num_slots, init_height, init_width, slot_dim)
+
+        x = x.permute(0, 3, 1, 2)   # (batch_size * num_slots, slot_dim, init_height, init_width)
+        #x = self.fc(x)
+        x = self.conv1(x)   # (batch_size * num_slots, 512, 16, 16)
+        x = self.mid_downsample(x)   # (batch_size * num_slots, 512, 14, 14)
+        x = self.conv2(x)   # (batch_size * num_slots, 256, 28, 28)
+        x = self.conv3(x)   # (batch_size * num_slots, 128, 56, 56)
+        x = self.conv4(x)   # (batch_size * num_slots, 64, 112, 112)
+        x = self.conv5(x)   # (batch_size * num_slots, 32, 224, 224)
+        x = self.conv6(x)   # (batch_size * num_slots, 16, 224, 224)
+        x = self.end_conv(x)   # (batch_size * num_slots, num_classes, 224, 224)
+        x = F.relu(x)
+
+        x = x.reshape(-1, self.num_slots,  self.num_channels + 1, 224, 224)   # (batch_size, num_slots, num_channels, 224, 224)
+
+        #x = x.squeeze()   # (batch_size, num_slots, 224, 224)
+       
+        # if self.num_slots > self.num_classes:
+        #     x = self.final_conv(x)
+
+        return x
     
     
 class SlotSpecificDecoder(nn.Module):
     """Decoder to transform each slot to a 2D feature map.
     This version has a separate decoder for each slot."""
-    def __init__(self, slot_dim, num_slots):
+    def __init__(self, slot_dim, num_slots, num_classes, include_recon=False, softmax_class=True, resolution=224,
+                 image_chans=1, decoder_type='slot_specific'):
         super().__init__()
         self.slot_dim = slot_dim
         self.num_slots = num_slots
-        #self.num_classes = num_classes
+        self.num_classes = num_classes
+        self.resolution = resolution
+        self.include_recon = include_recon
+        self.softmax_class = softmax_class
+        self.image_chans = image_chans
+        self.decoder_type = decoder_type
+        self.decoder_initial_size = (8, 8)
+        self.decoder_pos_embeddings = SoftPositionEmbed(slot_dim, self.decoder_initial_size)
 
-        self.decoders = nn.ModuleList([self.make_decoder() for _ in range(num_slots)])
+        if decoder_type == 'slot_specific':
+            self.start_decoder = nn.ModuleList([self.make_start_decoder() for _ in range(num_slots)])
+            self.end_decoder = nn.ModuleList([self.make_end_decoder() for _ in range(num_slots)])
+        elif decoder_type == 'shared':
+            self.start_decoder = self.make_start_decoder()
+            self.end_decoder = self.make_end_decoder()
 
-    def make_decoder(self):
+        # self.final_conv = nn.Sequential(
+        #     nn.BatchNorm2d(num_slots),
+        #     nn.Conv2d(num_slots*2, num_classes*2, kernel_size=1),
+        #     nn.ReLU()
+        # )
+
+    def make_start_decoder(self):
         return nn.Sequential(
-            nn.Linear(self.slot_dim, self.slot_dim * 4 * 4),
-            SlotReshape(self.slot_dim, self.num_slots),
-            Upsample(self.slot_dim, 512),
-            Upsample(512, 256),
-            Upsample(256, 128),
-            Upsample(128, 64),
-            Upsample(64, 32),
-            Upsample(32, 16),
-            nn.Conv2d(16, 1, kernel_size=33, padding=0)
+            ConvBlock(self.slot_dim, 512),   # (batch_size, 256, 8, 8)
+            Upsample(512, 256),   # (batch_size, 256, 16, 16)
+            # reduce from 16x16 to 14x14
+            # nn.Conv2d(256, 256, kernel_size=3, padding=0),   # (batch_size, 256, 14, 14)
+            # nn.BatchNorm2d(256),
+            # nn.ReLU(),
+            Upsample(256, 128),   # (batch_size, 128, 28, 28)
+            Upsample(128, 64),   # (batch_size, 64, 56, 56)
+            
         )
+    
+    def make_end_decoder(self):
+        if not self.include_recon:
+            return nn.Sequential(
+                Upsample(64, 32),   # (batch_size, 32, 112, 112)
+                Upsample(32, 16),    # (batch_size, 16, 224, 224)
+                nn.Conv2d(16, self.image_chans, kernel_size=3, padding=1),   # (batch_size, 1, 224, 224)
+            )
+        else:
+            return nn.Sequential(
+                Upsample(64, 32),   # (batch_size, 16, 112, 112)
+                Upsample(32, 16),    # (batch_size, 8, 224, 224)
+                nn.Conv2d(16, self.image_chans + 1, kernel_size=3, padding=1),   # (batch_size, 1, 224, 224)
+            )
+
 
     def forward(self, x):
-        # input, x has shape (batch_size, num_slots, slot_dim)
-        batch_size, num_slots, slot_dim = x.size()
-        decoded_slots = []
-        for i in range(num_slots):
-            decoded = self.decoders[i](x[:, i, :])  # (batch_size, 1, 224, 224)
-            decoded_slots.append(decoded)
+        batch_size, num_slots, slot_dim, init_height, init_width = x.size()
+        
+        if self.decoder_type == 'slot_specific':
+            # first slot decoding
+            decoded_slots = []
+            for i in range(self.num_slots):
+                slot = x[:, i, :, :, :].squeeze(1)
+                decoded = self.start_decoder[i](slot)
+                decoded = self.end_decoder[i](decoded)
+                decoded_slots.append(decoded)
 
-        x = torch.stack(decoded_slots, dim=1)   # (batch_size, num_slots, 1, 224, 224)
-        x = x.view(batch_size, num_slots, 224, 224)
+            x = torch.stack(decoded_slots, dim=1).squeeze(2)  # (batch_size, num_slots, chans + 1, 224, 224)
+
+        elif self.decoder_type == 'shared':
+            x = self.start_decoder(x.view(-1, slot_dim, init_height, init_width))
+            x = self.end_decoder(x)
+
+            x = x[:, :, :self.resolution, :self.resolution]
+        
+        # if self.num_slots > self.num_classes and not self.include_recon:
+        #     x = x.view(batch_size, -1, self.resolution, self.resolution)
+        #     x = self.final_conv(x)
+        #     x = x.view(batch_size, self.num_classes, -1, self.resolution, self.resolution)
+
+        if not self.include_recon:
+            x = x.squeeze()   # (batch_size, num_classes, self.resolution, self.resolution)
+            x = x.view(batch_size, self.num_classes, self.resolution, self.resolution)
+        else:
+            x = x.view(batch_size, self.num_slots, self.image_chans + 1, self.resolution, self.resolution)
 
         return x
