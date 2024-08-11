@@ -3,8 +3,10 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 from utils.utils import SoftPositionEmbed
-    
 
+import math
+from typing import Callable, Dict, Optional, Tuple, Union
+    
 class ConvBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
         super(ConvBlock, self).__init__()
@@ -41,21 +43,6 @@ class Downsample(nn.Module):
 
     def forward(self, x):
         return self.downsample(x)
-    
-class CNNEncoder(nn.Module):
-    """CNN Encoder to transform image to feature embeddings.	"""
-    def __init__(self, slot_dim, num_channels=1):
-        self.slot_dim = slot_dim
-        self.num_channels = num_channels
-
-        self.conv1 = ConvBlock(num_channels, 16) 
-        self.conv2 = Downsample(16, 32)
-        self.conv3 = Downsample(32, 64)
-        self.conv4 = Downsample(64, 128)
-        self.conv5 = Downsample(128, 256)
-        self.conv6 = Downsample(256, 512)
-        self.conv7 = Downsample(512, 512)
-
 
 
 class Decoder(nn.Module):
@@ -136,6 +123,8 @@ class SlotSpecificDecoder(nn.Module):
             self.start_decoder = self.make_start_decoder()
             self.end_decoder = self.make_end_decoder()
 
+        self.training = True
+
         # self.final_conv = nn.Sequential(
         #     nn.BatchNorm2d(num_slots),
         #     nn.Conv2d(num_slots*2, num_classes*2, kernel_size=1),
@@ -144,61 +133,139 @@ class SlotSpecificDecoder(nn.Module):
 
     def make_start_decoder(self):
         return nn.Sequential(
-            ConvBlock(self.slot_dim, 512),   # (batch_size, 256, 8, 8)
-            Upsample(512, 256),   # (batch_size, 256, 16, 16)
-            # reduce from 16x16 to 14x14
-            # nn.Conv2d(256, 256, kernel_size=3, padding=0),   # (batch_size, 256, 14, 14)
-            # nn.BatchNorm2d(256),
-            # nn.ReLU(),
-            Upsample(256, 128),   # (batch_size, 128, 28, 28)
-            Upsample(128, 64),   # (batch_size, 64, 56, 56)
-            
+            ConvBlock(self.slot_dim, 1024),   # (batch_size, 512, 8, 8) # 64
+            Upsample(1024, 512),   # (batch_size, 256, 16, 16) # 64
+            Upsample(512, 256),   # (batch_size, 128, 28, 28) # 64
+            Upsample(256, 128),   # (batch_size, 64, 56, 56) # 64
+            Upsample(128, 64),   # (batch_size, 32, 112, 112) #32
         )
     
     def make_end_decoder(self):
         if not self.include_recon:
             return nn.Sequential(
-                Upsample(64, 32),   # (batch_size, 32, 112, 112)
-                Upsample(32, 16),    # (batch_size, 16, 224, 224)
+                 # 128 + 64 
+                Upsample(64, 32),   # (batch_size, 32, 112, 112) #32
+                Upsample(32, 16),    # (batch_size, 16, 2216, 224) # 8
                 nn.Conv2d(16, self.image_chans, kernel_size=3, padding=1),   # (batch_size, 1, 224, 224)
             )
         else:
             return nn.Sequential(
+                #Upsample(64, 64),  # 192
                 Upsample(64, 32),   # (batch_size, 16, 112, 112)
-                Upsample(32, 16),    # (batch_size, 8, 224, 224)
+                Upsample(32, 16),    # (batch_size, 8, 2216, 224)
                 nn.Conv2d(16, self.image_chans + 1, kernel_size=3, padding=1),   # (batch_size, 1, 224, 224)
             )
 
+    # def make_start_decoder(self):
+    #     return nn.Sequential(
+    #         #ConvBlock(self.slot_dim, 512),   # (batch_size, 512, 8, 8) # 64
+    #         Upsample(self.slot_dim, 64),   # (batch_size, 256, 16, 16) # 64
+    #         # reduce from 16x16 to 14x14
+    #         # nn.Conv2d(256, 256, kernel_size=3, padding=0),   # (batch_size, 256, 14, 14)
+    #         # nn.BatchNorm2d(256),
+    #         # nn.ReLU(),
+    #         Upsample(64, 32),   # (batch_size, 128, 28, 28) # 64
+    #         Upsample(32, 16),   # (batch_size, 64, 56, 56) # 64
+    #     )
+    
+    # def make_end_decoder(self):
+    #     if not self.include_recon:
+    #         return nn.Sequential(
+    #              # 128 + 64 
+    #             Upsample(16, 8),   # (batch_size, 32, 112, 112) #32
+    #             Upsample(8, 4),    # (batch_size, 16, 224, 224) # 8
+    #             nn.Conv2d(4, self.image_chans, kernel_size=3, padding=1),   # (batch_size, 1, 224, 224)
+    #         )
+    #     else:
+    #         return nn.Sequential(
+    #             #Upsample(128, 64),  # 192
+    #             Upsample(16, 8),   # (batch_size, 16, 112, 112)
+    #             Upsample(8, 4),    # (batch_size, 8, 224, 224)
+    #             nn.Conv2d(4, self.image_chans + 1, kernel_size=3, padding=1),   # (batch_size, 1, 224, 224)
+    #         )
 
-    def forward(self, x):
+    def forward(self, x, res_feats=None):
         batch_size, num_slots, slot_dim, init_height, init_width = x.size()
+    
+        x1 = self.start_decoder(x.view(-1, slot_dim, init_height, init_width))
+
+        # concat res feats
+        # dropout res_feats
+        # res_feats = F.dropout(res_feats, p=0.5, training=self.training)
+        # res_feats = res_feats.repeat(num_slots, 1, 1, 1)
+      
+        # # repeat batch dimension by number of slots
         
-        if self.decoder_type == 'slot_specific':
-            # first slot decoding
-            decoded_slots = []
-            for i in range(self.num_slots):
-                slot = x[:, i, :, :, :].squeeze(1)
-                decoded = self.start_decoder[i](slot)
-                decoded = self.end_decoder[i](decoded)
-                decoded_slots.append(decoded)
+        # x1 = torch.cat([x1, res_feats], dim=1) # concatenated along the channel dimension
 
-            x = torch.stack(decoded_slots, dim=1).squeeze(2)  # (batch_size, num_slots, chans + 1, 224, 224)
+        x2 = self.end_decoder(x1)
 
-        elif self.decoder_type == 'shared':
-            x = self.start_decoder(x.view(-1, slot_dim, init_height, init_width))
-            x = self.end_decoder(x)
-
-            x = x[:, :, :self.resolution, :self.resolution]
-        
-        # if self.num_slots > self.num_classes and not self.include_recon:
-        #     x = x.view(batch_size, -1, self.resolution, self.resolution)
-        #     x = self.final_conv(x)
-        #     x = x.view(batch_size, self.num_classes, -1, self.resolution, self.resolution)
+        x2 = x2[:, :, :self.resolution, :self.resolution]
 
         if not self.include_recon:
-            x = x.squeeze()   # (batch_size, num_classes, self.resolution, self.resolution)
-            x = x.view(batch_size, self.num_classes, self.resolution, self.resolution)
+            x2 = x2.squeeze()   # (batch_size, num_classes, self.resolution, self.resolution)
+            x2 = x2.view(batch_size, self.num_classes, self.resolution, self.resolution)
         else:
-            x = x.view(batch_size, self.num_slots, self.image_chans + 1, self.resolution, self.resolution)
+            x2 = x2.view(batch_size, self.num_slots, self.image_chans + 1, self.resolution, self.resolution)
 
-        return x
+        return x2
+    
+# Code taken from spot https://github.com/gkakogeorgiou/spot/blob/master/mlp.py and is based on 
+# https://github.com/amazon-science/object-centric-learning-framework/blob/main/ocl
+class MlpDecoder(nn.Module):
+    """Decoder that takes object representations and reconstructs patches.
+
+    Args:
+        object_dim: Dimension of objects representations.
+        output_dim: Dimension of each patch.
+        num_patches: Number of patches P to reconstruct.
+        hidden_features: Dimension of hidden layers.
+    """
+
+    def __init__(self, object_dim, output_dim, num_patches, hidden_features = 2048):
+        super().__init__()
+        self.output_dim = output_dim
+        self.num_patches = num_patches
+        
+        self.pos_embed = nn.Parameter(torch.randn(1, num_patches, object_dim) * 0.02)
+        self.decoder = build_mlp(object_dim, output_dim + 1, hidden_features)
+
+    def forward(self, encoder_output):
+
+        initial_shape = encoder_output.shape[:-1]
+        encoder_output = encoder_output.flatten(0, -2)
+
+        encoder_output = encoder_output.unsqueeze(1).expand(-1, self.num_patches, -1)
+
+        # Simple learned additive embedding as in ViT
+        object_features = encoder_output + self.pos_embed
+
+        output = self.decoder(object_features)
+        output = output.unflatten(0, initial_shape)
+
+        # Split out alpha channel and normalize over slots.
+        decoded_patches, alpha = output.split([self.output_dim, 1], dim=-1)
+        alpha = alpha.softmax(dim=-3)
+
+        reconstruction = torch.sum(decoded_patches * alpha, dim=-3)
+        masks = alpha.squeeze(-1)
+        
+        return reconstruction, masks
+    
+    
+def build_mlp(input_dim = int, output_dim = int, hidden_features = 2048, n_hidden_layers = 3):
+    
+    layers = []
+    current_dim = input_dim
+    features = [hidden_features]*n_hidden_layers
+
+    for n_features in features:
+        layers.append(nn.Linear(current_dim, n_features))
+        nn.init.zeros_(layers[-1].bias)
+        layers.append(nn.ReLU(inplace=True))
+        current_dim = n_features
+
+    layers.append(nn.Linear(current_dim, output_dim))
+    nn.init.zeros_(layers[-1].bias)
+
+    return nn.Sequential(*layers)

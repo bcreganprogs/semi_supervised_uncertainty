@@ -7,6 +7,7 @@ from torchvision.io import read_image
 from torchvision import transforms
 from torchvision import tv_tensors
 from torchvision.transforms import v2
+import torchvision.transforms.functional as F
 from pytorch_lightning import LightningModule, LightningDataModule
 import numpy as np
 import pandas as pd
@@ -16,6 +17,7 @@ from skimage.io import imread
 from typing import Optional, Callable
 from PIL import Image
 import h5py
+import nibabel as nib
 
 import zipfile
 import urllib.request as urllib2
@@ -44,9 +46,9 @@ class JSRTDataset(Dataset):
             transforms.RandomRotation(20, interpolation=transforms.InterpolationMode.NEAREST),
             transforms.RandomHorizontalFlip(p=0.2),
             transforms.RandomVerticalFlip(p=0.2),
-            transforms.RandomApply(transforms=[
-                transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
-            ], p=0.2),
+            # transforms.RandomApply(transforms=[
+            #     transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
+            # ], p=0.2),
         ])
 
         # collect samples (file paths) from dataset
@@ -113,8 +115,8 @@ class JSRTDataModule(LightningDataModule):
             download_JRST(data_dir)
 
         self.data = pd.read_csv(os.path.join(self.data_dir, 'jsrt_metadata.csv'))
-        dev, self.test_data = train_test_split(self.data, test_size=0.9)
-        self.train_data, self.val_data = train_test_split(dev, test_size=0.9)
+        dev, self.test_data = train_test_split(self.data, test_size=0.1)
+        self.train_data, self.val_data = train_test_split(dev, test_size=0.05)
 
         self.train_set = JSRTDataset(self.train_data, self.data_dir, augmentation=augmentation)
         self.val_set = JSRTDataset(self.val_data, self.data_dir, augmentation=False)
@@ -233,6 +235,160 @@ class CheXpertDataModule(LightningDataModule):
         self.train_set = CheXpertDataset(self.train_data, self.data_dir, augmentation=True, cache=cache)
         self.val_set = CheXpertDataset(self.val_data, self.data_dir, augmentation=False, cache=cache)
         self.test_set = CheXpertDataset(self.test_data, self.data_dir, augmentation=False, cache=cache)
+
+    def train_dataloader(self):
+        return DataLoader(dataset=self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+
+    def val_dataloader(self):
+        return DataLoader(dataset=self.val_set, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+
+    def test_dataloader(self):
+        return DataLoader(dataset=self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+    
+class SynthCardDataset(Dataset):
+    def __init__(self, data: list, data_dir: str, augmentation: bool = False, cache: bool = False, rate_maps: float = 1.0):
+        # download zip file from https://www.doc.ic.ac.uk/~bglocker/teaching/mli/JSRT.zip
+        # and extract it to a directory
+
+        self.data = data
+        self.data_dir = data_dir
+        self.do_augment = augmentation
+        self.cache = cache
+        self.rate_maps = rate_maps
+
+        if cache:
+            self.cache = SharedCache(
+                size_limit_gib=24,
+                dataset_len=len(self.data),
+                data_dims=[1, 128, 128],
+                dtype=torch.float32,
+            )
+        else:
+            self.cache = None
+
+        # photometric data augmentation
+        #self.photometric_augment = transforms.Compose([
+            #transforms.RandomRotation(90),
+            #transforms.RandomHorizontalFlip(p=0.15),
+            #transforms.RandomVerticalFlip(p=0.15),
+
+        #])
+
+        # geometric data augmentation
+        self.geometric_augment = transforms.Compose([
+            transforms.RandomApply(transforms=[transforms.RandomAffine(degrees=5, scale=(0.9, 1.1), interpolation=transforms.InterpolationMode.NEAREST)], 
+                                                p = 0.5),
+            transforms.RandomRotation(15),
+            transforms.RandomApply(transforms=[transforms.RandomResizedCrop(128, scale=(0.8, 1.0), ratio=(0.75, 1.1))] , p=0.3),
+            #transforms.RandomHorizontalFlip(p=0.3), 
+            #transforms.RandomVerticalFlip(p=0.3),
+        ])
+
+        # collect samples (file paths) from dataset
+        self.samples = []
+        for idx, _ in enumerate(tqdm(range(len(data)), desc='Loading Data')):
+
+            sample = {'image_path': data[idx]}
+            self.samples.append(sample)
+
+    def __len__(self):
+        return len(self.data)
+
+    def __getitem__(self, item):
+        
+        # if self.cache is not None:
+        #     sample = self.cache.get_slot(item)
+        #     if sample is None:
+        #         sample = self.get_sample(item)
+        #         self.cache.set_slot(item, sample, allow_overwrite=False)
+        # else:
+        sample = self.get_sample(item)
+
+        # add batch dimension
+        image, labelmap = sample[0], sample[1]#torch.chunk(sample, chunks=2, dim=0)
+
+        # apply data augmentation
+        if self.do_augment:
+            #image = self.photometric_augment(image.type(torch.ByteTensor)).type(torch.FloatTensor)
+            #image = self.geometric_augment(image.type(torch.ByteTensor)).type(torch.FloatTensor)
+            # Stack the image and mask together so they get the same geometric transformations
+            labelmap = torch.stack(labelmap, dim=0).squeeze(1)
+
+            image.unsqueeze(0)
+ 
+            stacked = torch.cat([image, labelmap], dim=0)  # shape=(6xHxW)
+            stacked = self.geometric_augment(stacked)
+
+            # Split them back up again and convert labelmap back to datatype long
+            image = stacked[0, ...].unsqueeze(0)
+            labelmap = stacked[1:, ...]
+            labelmap = labelmap.type(torch.LongTensor)
+
+            # convert labelmap back to list
+            #labelmap = [labelmap[i, ...].unsqueeze(0) for i in range(labelmap.shape[0])]
+        else:
+            labelmap = torch.stack(labelmap, dim=0).squeeze(1)
+
+        # normalize image intensities to [0,1]
+        image /= 255
+
+        return {'image': image, 'labelmap': labelmap}
+
+    def get_sample(self, item):
+        sample = self.data[item]
+        # read image and labelmap from disk
+        image = read_image(sample[0]).type(torch.float32)
+        maps = []
+        for seg in sample[1]:
+            labelmap = read_image(seg).type(torch.uint8).long()
+            #print(torch.unique(labelmap)) # 0, 63, 127, 255
+            # convert labelmap to consecutive labels
+            labelmap[labelmap==63] = 1 # heart
+            labelmap[labelmap==127] = 2 # left lung
+            labelmap[labelmap==255] = 3 # right lung
+            labelmap[labelmap==0] = 0 # background
+            maps.append(labelmap)
+
+        if torch.rand(1) > self.rate_maps:  # randomly remove labelmaps
+            maps = [torch.zeros_like(maps[0]) for _ in range(len(maps))]
+
+        #stacked = torch.cat([image, labelmap], dim=0)  # shape=(2xHxW)
+        # print(image.shape, len(maps))
+        return image, maps
+    
+class SynthCardDataModule(LightningDataModule):
+    def __init__(self, data_dir: str = '/vol/biomedic3/bglocker/cardiac_synth2d/', batch_size: int = 32, num_workers: int = 6, cache: bool = False, rate_maps: float = 1.0):
+        super().__init__()
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+        # if jsrt_metadata.csv does not exist, download the dataset
+        # if not os.path.exists(os.path.join(self.data_dir, 'jsrt_metadata.csv')):
+        #     download_JRST(data_dir)
+
+        files = os.listdir(data_dir + '/avg_img/')
+        seg_maps = os.listdir(data_dir + '/seg/')
+
+        ims = [os.path.join(data_dir + '/avg_img/', file) for file in files]
+        segs = [os.path.join(data_dir + '/seg/', file) for file in seg_maps]
+
+        # order lists
+        ims.sort()
+        segs.sort()
+        # group segs into chunks of 5
+        segs = [segs[i:i+5] for i in range(0, len(segs), 5)]
+        
+        ims = [d for d in ims if 'desktop.ini' not in d]
+        self.data = list(zip(ims, segs))
+        # remove 'desktop.ini' file
+        #self.data = [d for d in self.data if 'desktop.ini' not in d[0]]
+        dev, self.test_data = train_test_split(self.data, test_size=0.2)
+        self.train_data, self.val_data = train_test_split(dev, test_size=0.05)
+
+        self.train_set = SynthCardDataset(self.train_data, self.data_dir, augmentation=True, cache=cache, rate_maps=rate_maps)
+        self.val_set = SynthCardDataset(self.val_data, self.data_dir, augmentation=False, cache=cache, rate_maps = 1.0)
+        self.test_set = SynthCardDataset(self.test_data, self.data_dir, augmentation=False, cache=cache, rate_maps = 1.0)
 
     def train_dataloader(self):
         return DataLoader(dataset=self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
@@ -447,6 +603,149 @@ class LIDCDataModule(LightningDataModule):
         self.train_set = LIDCDataGenerator(augment=True, scale_range=0.1, rotation_degree=10, subset="train")
         self.val_set = LIDCDataGenerator(augment=False, subset="val")
         self.test_set = LIDCDataGenerator(augment=False, subset="test")
+
+    def train_dataloader(self):
+        return DataLoader(dataset=self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
+
+    def val_dataloader(self):
+        return DataLoader(dataset=self.val_set, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+
+    def test_dataloader(self):
+        return DataLoader(dataset=self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+    
+class CURVASDataset(Dataset):
+    def __init__(self, data: list, data_dir: str, augmentation: bool = False, cache: bool = False):
+        # download zip file from https://www.doc.ic.ac.uk/~bglocker/teaching/mli/JSRT.zip
+        # and extract it to a directory
+
+        self.data = data
+        self.data_dir = data_dir
+        self.do_augment = augmentation
+        self.cache = cache
+
+        if cache:
+            self.cache = SharedCache(
+                size_limit_gib=90,
+                dataset_len=len(self.data)*1030, # roughly 1030 slices per image
+                data_dims=[4, 512, 512],
+                # set dtype to tuple?
+                dtype=torch.float32,
+            )
+        else:
+            self.cache = None
+
+        # photometric data augmentation
+        self.photometric_augment = transforms.Compose([
+            transforms.RandomApply(transforms=[transforms.ColorJitter(brightness=0.2, contrast=0.2)], p=0.5),
+        ])
+
+        # geometric data augmentation
+        self.geometric_augment = transforms.Compose([
+            transforms.RandomHorizontalFlip(p=0.25),
+            transforms.RandomVerticalFlip(p=0.25),
+            transforms.RandomRotation(degrees=15),
+            transforms.RandomResizedCrop(size=(512, 512), scale=(0.8, 1.0), ratio=(0.75, 1.3333333333333333), interpolation=2),
+        ])
+
+        # collect samples (file paths) from dataset
+        self.samples = []
+        self.slices = []
+        self.num_slices = 0
+        for idx, _ in enumerate(tqdm(range(len(data)), desc='Loading Data')):
+   
+            sample = {'image_path': data[idx]}
+            self.samples.append(sample)
+
+            # get 3D image
+            image, maps = self.get_sample(sample)
+            
+            if self.cache is not None:
+                for i in range(image.shape[-1]):
+                    mem = torch.stack([image[:, :, i], maps[0][:, :, i], maps[1][:, :, i], maps[2][:, :, i]], dim=0)
+                    self.cache.set_slot(self.num_slices + i, mem, allow_overwrite=False)
+            else:
+                for i in range(image.shape[-1]):
+                    self.slices.append((image[:, :, i], [maps[0][:, :, i], maps[1][:, :, i], maps[2][:, :, i]]))
+
+            self.num_slices += image.shape[-1]
+
+
+    def __len__(self):
+        return self.num_slices
+
+    def __getitem__(self, item):
+
+        if self.cache is not None:
+            image, annotation1, annotation2, annotation3 = torch.chunk(self.cache.get_slot(item), chunks=4, dim=0)
+            maps = torch.stack([annotation1, annotation2, annotation3], dim=0)
+            if image is None:
+                image, maps = torch.split(self.get_sample(item), [1, 3], dim=0)
+                for i in range(len(image)):
+                    mem = torch.stack([image[:, :, i], maps[0][:, :, i], maps[1][:, :, i], maps[2][:, :, i]], dim=0)
+                    self.cache.set_slot(i*item + 1, mem, allow_overwrite=False)
+        else:
+            image, maps = self.slices[item]
+            maps = torch.stack(maps, dim=0)
+
+        #print(image.shape, maps.shape)      # (512, 512) (3, 512, 512)
+
+        # adjust contrast
+        image = F.adjust_contrast(image.unsqueeze(0), 1.02).squeeze(0)
+        # apply data augmentation
+        if self.do_augment:
+            #image = self.photometric_augment(image.type(torch.ByteTensor)).type(torch.FloatTensor)
+
+            # Stack the image and mask together so they get the same geometric transformations
+            
+            stacked = torch.cat([image.unsqueeze(0), maps], dim=0)  # shape (4, 512, 512)
+            stacked = self.geometric_augment(stacked)
+
+            # Split them back up again and convert labelmap back to datatype long
+            image, annotation1, annotation2, annotation3 = torch.chunk(stacked, chunks=4, dim=0)    # shape (1, 512, 512)
+            image = image.squeeze(0)
+        else:
+            annotation1, annotation2, annotation3 = maps.split(1, dim=0)
+
+        labelmap = torch.cat([annotation1, annotation2, annotation3], dim=0).long()
+
+        #image = image#.unsqueeze(0)
+        labelmap = labelmap.squeeze(1)
+
+        return {'image': image, 'labelmap': labelmap}
+
+    def get_sample(self, item):
+        sample = item  #self.samples[item]
+
+        # read image and labelmap from disk
+        image = nib.load(sample['image_path'] + '/image.nii.gz').get_fdata()
+        image = torch.from_numpy(image).float()     # shape (512, 512, 1010-ish)
+
+        annotation1 = nib.load(sample['image_path'] + '/annotation_1.nii.gz').get_fdata()
+        annotation2 = nib.load(sample['image_path'] + '/annotation_2.nii.gz').get_fdata()
+        annotation3 = nib.load(sample['image_path'] + '/annotation_3.nii.gz').get_fdata()
+        annotation1 = torch.from_numpy(annotation1).long()              # shape (512, 512, 1010-ish)
+        annotation2 = torch.from_numpy(annotation2).long()              # unique values 0, 1, 2, 3
+        annotation3 = torch.from_numpy(annotation3).long()              # 0 background, 1 pancreas, 1 kidney, 3 liver
+
+        maps = [annotation1, annotation2, annotation3]
+
+        return image, maps
+    
+class CURVASDataModule(LightningDataModule):
+    def __init__(self, data_dir: str = '/vol/bitbucket/bc1623/project/semi_supervised_uncertainty/data/CURVAS/training_set/', batch_size: int = 32, num_workers: int = 6, cache: bool = False):
+        super().__init__()
+        self.data_dir = data_dir
+        self.batch_size = batch_size
+        self.num_workers = num_workers
+
+        files = os.listdir(data_dir)   
+        self.data = [os.path.join(data_dir, file) for file in files]
+        dev, self.test_data = train_test_split(self.data, test_size=0.05)
+        self.train_data, self.val_data = train_test_split(dev, test_size=0.15)
+
+        self.train_set = CURVASDataset(self.train_data, self.data_dir, augmentation=True, cache=cache)
+        self.val_set = CURVASDataset(self.val_data, self.data_dir, augmentation=False, cache=cache)
+        self.test_set = CURVASDataset(self.test_data, self.data_dir, augmentation=False, cache=cache)
 
     def train_dataloader(self):
         return DataLoader(dataset=self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)

@@ -8,14 +8,14 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
 from pytorch_lightning import LightningModule
 import wandb
 
-from utils.utils import SoftPositionEmbed, spatial_broadcast, unstack_and_split
-from models.slot_attention import ProbabalisticSlotAttention, FixedSlotAttention, SlotAttention, FixedSlotAttentionMultiHead
+from utils.utils import SoftPositionEmbed, spatial_broadcast, unstack_and_split, ConvCrossAttention
+from models.slot_attention import ProbabalisticSlotAttention, FixedSlotAttention, SlotAttention, FixedSlotAttentionMultiHead, FixedSlotAttentionMultiHeadProb
 from models.decoders import SlotSpecificDecoder, Decoder
 
 class ObjectSpecificSegmentation(LightningModule):
     def __init__(self, encoder, num_slots, num_iterations, num_classes, slot_dim=128, task='recon', include_seg_loss=False, slot_attn_type='standard', decoder_type='slot_specific', 
                 learning_rate=1e-3, image_chans=1, embedding_dim=768, image_resolution=224, softmax_class=True, temperature=1, freeze_encoder=False, lr_warmup=True, log_images=True,
-                embedding_shape=None, multi_truth=False):
+                embedding_shape=None, multi_truth=False, include_mlp=False, include_pos_embed=False):
         super(ObjectSpecificSegmentation, self).__init__()
 
         self.encoder = encoder
@@ -26,11 +26,14 @@ class ObjectSpecificSegmentation(LightningModule):
         if slot_attn_type == 'standard':
             self.slot_attention = SlotAttention(num_slots, slot_dim, num_iterations, temperature=temperature)
         elif slot_attn_type == 'probabilistic':
-            self.slot_attention = ProbabalisticSlotAttention(num_slots=num_slots, dim=slot_dim, num_iterations=num_iterations, temperature=temperature)
+            #self.slot_attention = ProbabalisticSlotAttention(num_slots=num_slots, dim=slot_dim, num_iterations=num_iterations, temperature=temperature)
+            self.slot_attention = FixedSlotAttentionMultiHeadProb(num_slots=num_slots, dim=slot_dim, num_iterations=num_iterations, temperature=temperature)
         elif slot_attn_type == 'fixed':
             self.slot_attention = FixedSlotAttention(num_slots=num_slots, dim=slot_dim, num_iterations=num_iterations, temperature=temperature)
         else:
-            self.slot_attention = FixedSlotAttentionMultiHead(num_slots, slot_dim, num_iterations, temperature=temperature, probabalistic=False)
+            self.slot_attention = FixedSlotAttentionMultiHead(num_slots, slot_dim, num_iterations, temperature=temperature)
+        
+        #self.res_attention = ConvCrossAttention(64, 64)
             
         # decoder
         self.decoder_type = decoder_type
@@ -57,6 +60,8 @@ class ObjectSpecificSegmentation(LightningModule):
         self.include_seg_loss = include_seg_loss
         self.image_resolution = image_resolution
         self.multi_truth = multi_truth
+        self.include_mlp = include_mlp
+        self.include_pos_embed = include_pos_embed
 
         # classification head
         self.softmax_class = softmax_class
@@ -68,14 +73,15 @@ class ObjectSpecificSegmentation(LightningModule):
             for param in self.encoder.parameters():
                 param.requires_grad = True
 
-        self.mlp = nn.Sequential(
-            nn.Linear(embedding_dim, embedding_dim*2),
-            nn.ReLU(),
-            nn.Linear(embedding_dim*2, slot_dim),
-        )
+        if include_mlp:
+            self.mlp = nn.Sequential(
+                nn.Linear(embedding_dim, embedding_dim, bias=False),
+                nn.LeakyReLU(),
+                nn.Linear(embedding_dim, slot_dim, bias=False),
+            )
+            self.mlp.apply(self.init_weights)
 
         self.decoder.apply(self.init_weights)
-        self.mlp.apply(self.init_weights)
         self.slot_attention.apply(self.init_weights)
 
         self.test_predmaps = []
@@ -109,40 +115,55 @@ class ObjectSpecificSegmentation(LightningModule):
             patch_embeddings = patch_embeddings[:, 1:, :]       # exclude cls token
             
         except:
-            patch_embeddings = self.encoder(x)    
+            patch_embeddings, res_features = self.encoder(x)  # shape (batch_size, 256, 8, 8)
+            patch_embeddings = patch_embeddings.permute(0, 2, 3, 1) # shape (batch_size, 8, 8, embed_dim)
 
-        
         # add position embeddings
-        # patch_embeddings = patch_embeddings.reshape(batch_size, self.embedding_shape[0], self.embedding_shape[1], -1)     # combine patches into image
-        # patch_embeddings = self.encoder_pos_embeddings(patch_embeddings)   # shape (batch_size, 14, 14, embed_dim)
-        # patch_embeddings = patch_embeddings.reshape(batch_size, int(self.embedding_shape[0] * self.embedding_shape[1]), -1)   # shape (batch_size, num_patches, embed_dim)
+        if self.include_pos_embed:
+            patch_embeddings = self.encoder_pos_embeddings(patch_embeddings)   # shape (batch_size, 14, 14, embed_dim)
+            #patch_embeddings = patch_embeddings.reshape(batch_size, int(self.embedding_shape[0] * self.embedding_shape[1]), -1)   # shape (batch_size, num_patches, embed_dim)
         
-        patch_embeddings = self.embedding_norm(patch_embeddings)
-        patch_embeddings = self.mlp(patch_embeddings)  # shape (batch_size*num_patches, embed_dim)
+        if self.include_mlp:
+            patch_embeddings = self.embedding_norm(patch_embeddings)
+            patch_embeddings = patch_embeddings.view(patch_embeddings.shape[0], -1, patch_embeddings.shape[-1])  # shape (batch_size, num_patches, embed_dim)
+            patch_embeddings = self.mlp(patch_embeddings)  # shape (batch_size, 8, 8, embed_dim)
 
         slots, attn = self.slot_attention(patch_embeddings)  # shape (batch_size, num_slots, slot_dim)
+        # perform high level slot attention here
         
         #x = spatial_broadcast(slots, self.decoder.decoder_initial_size)  # shape (batch_size*num_slots, width_init, height_init, slot_dim)
         # spatial broadcast
         x = slots.view(-1, slots.shape[-1])[:, :, None, None]
         x = x.repeat(1, 1, *self.decoder.decoder_initial_size)  # shape (batch_size*num_slots, slot_dim, width_init, height_init
         x = x.permute(0, 2, 3, 1)  # shape (batch_size*num_slots, width_init, height_init, slot_dim)
-     
+        
         if self.task == 'recon':
             x = self.decoder_pos_embeddings(x)
-            x = x.view(batch_size, slots.shape[1], 8, 8, x.shape[-1])
+            x = x.view(batch_size, self.num_slots, 8, 8, x.shape[-1]) # shape (batch_size, num_slots, 8, 8, slot_dim)
             x = x.permute(0, 1, 4, 2, 3) # shape (batch_size, num_slots, slot_dim, width_init, height_init)
-            x = self.decoder(x).to(patch_embeddings.device)     # shape (batch_size, num_classes, H, W)
+            # = self.decoder_1(x).to(patch_embeddings.device)     # shape (batch_size, num_classes, H, W)
+            x = self.decoder.forward(x)  # shape (batch_size, num_classes, 224, 224)
+
+            #x = self.decoder.forward_2(x)  # shape (batch_size, num_classes, 224, 224)
+            # include high level features
             decoded, masks = torch.split(x, [self.image_chans, 1], dim=2)
+            #decoded, vars, masks = torch.split(x, [self.image_chans, 1, 1], dim=2)
             masks = F.softmax(masks, dim=1)         # softmax over self.num_slotslasses
+
             recons = torch.sum(decoded * masks, dim=1)
+            #vars = torch.sum(vars * masks, dim=1)
             
         else: # segmentation
             if self.decoder_type == 'slot_specific':
                 x = self.decoder_pos_embeddings(x)     # shape (batch_size, num_classes, H, W)
                 x = x.view(batch_size, slots.shape[1], 8, 8, x.shape[-1])
                 x = x.permute(0, 1, 4, 2, 3)  # shape (batch_size, num_slots, slot_dim, width_init, height_init)
-                x = self.decoder(x)  # shape (batch_size, num_classes, 224, 224)
+                x = self.decoder_1(x)  # shape (batch_size, num_classes, 224, 224)
+
+                # cross attention between x and high level features
+                #x = self.res_attention(x, res_features)
+
+                x = self.decoder_2(x)  # shape (batch_size, num_classes, 224, 224)
                 recons, masks = x, None
             else:
                 x = self.decoder_pos_embeddings(x)     # shape (batch_size, num_classes, H, W)
@@ -151,7 +172,7 @@ class ObjectSpecificSegmentation(LightningModule):
                 recons = decoded
                 masks = masks
 
-        return recons, masks, attn
+        return recons, masks, attn  #recons, vars, masks, attn
     
     def init_weights(self, m):
         if isinstance(m, (nn.Linear, nn.Conv2d, nn.Parameter)):
@@ -160,7 +181,7 @@ class ObjectSpecificSegmentation(LightningModule):
                 nn.init.zeros_(m.bias)
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=1e-6)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)#, weight_decay=1e-6)
         if not self.lr_warmup:
             return optimizer
 
@@ -183,16 +204,38 @@ class ObjectSpecificSegmentation(LightningModule):
             else:
                 return 0.5 ** ((current_step - warmup_steps) / decay_steps)
         return LambdaLR(optimizer, lr_lambda)
+    
+    # def mask_entropy(self, masks):
+
+    #     entropy = -(masks * torch.log(masks + 1e-6)).sum(dim=[1, 2]).mean()
+    #     return -entropy
+    
+    # def min_area_loss(self, masks, min_area_ratio=0.02):
+    #     areas = masks.sum(dim=[2, 3]) / (masks.shape[2] * masks.shape[3])
+    #     return F.relu(min_area_ratio - areas).mean()
+    
+    # def mask_exclusivity_loss(self, masks):
+    #     b, n, h, w = masks.squeeze().shape
+    #     masks_flat = masks.view(b, n, -1)
+        
+    #     # Calculate L1 distance between masks at each spatial location
+    #     distances = torch.abs(masks_flat.unsqueeze(2) - masks_flat.unsqueeze(1))
+        
+    #     # We want to maximize this distance, so we minimize its negative
+    #     return -distances.mean()
 
     def process_batch(self, batch, batch_idx):
 
         if self.task == 'recon':
             if self.include_seg_loss:
                 x, y = batch['image'], batch['labelmap']
+                # select random from second dimension
+                y = y[:, torch.randint(0, y.shape[1], (1,))]
             else:
                 x = batch['image']
             
             x = x.float() 
+
             recons, masks, attn = self(x)
             if self.softmax_class:
                 mask_probs = torch.softmax(masks, dim=1)
@@ -201,13 +244,26 @@ class ObjectSpecificSegmentation(LightningModule):
                 mask_probs = masks
                 preds = torch.round(mask_probs)
 
-            recon_loss = F.mse_loss(recons.squeeze(), x.squeeze())      #recon loss
+
+            recon_loss = F.mse_loss(recons.squeeze(), x.squeeze()) #+ 0.0001*mask_div_loss      #recon loss
+
             if self.include_seg_loss:
-                seg_loss = F.cross_entropy(masks.squeeze(), y.squeeze())     # segmentation loss
-                loss = seg_loss
-                dsc = dice(preds, y.squeeze(), average='macro', num_classes=self.num_classes, ignore_index=0)
+                loss = 1.0 * recon_loss #+ mask_entropy
+                # only consider masks and y for which y is not all zeros
+                # indices = torch.where(y.squeeze().sum(dim=(1, 2)) > 0)[0]
+                # loss_masks = masks[indices]
+                # y = y[indices]
+  
+                # if  y is not empty
+                # if len(indices) > 0:
+                seg_loss = F.cross_entropy(masks, y, reduction='mean')     # segmentation loss
+                loss += seg_loss 
+                #preds = preds[indices]
+                dsc = dice(preds, y, average='macro', num_classes=self.num_classes, ignore_index=0)
+                # else:
+                #     dsc = 0
             else:
-                loss = recon_loss
+                loss = recon_loss #+ mask_entropy
                 dsc = 0
 
             probs = torch.softmax(recons, dim=1)
@@ -321,8 +377,10 @@ class ObjectSpecificSegmentation(LightningModule):
     def _log_key_images(self):
         recons, attn, masks, preds = self.val_recons, self.val_attn, self.val_masks, self.val_preds
         recons_grid = make_grid(recons)
-        attn_maps = make_grid(attn.reshape(-1, 1, 14, 14), nrow=self.num_slots)
-        masks = make_grid(masks.reshape(-1, 1, 14, 14), nrow=self.num_slots).float()
+        #print(attn.shape) #attn shape (batch_size, num_slots, embedding_shape[0], embedding_shape[1])
+        attn = attn.reshape(-1, self.num_slots, self.embedding_shape[0], self.embedding_shape[1])
+        attn_maps = make_grid(attn.reshape(-1, 1, self.embedding_shape[0], self.embedding_shape[1]), nrow=self.num_slots)
+        masks = make_grid(masks.reshape(-1, 1, self.embedding_shape[0], self.embedding_shape[1]), nrow=self.num_slots).float()
    
         self.logger.experiment.log({
             "Reconstructed Images": [

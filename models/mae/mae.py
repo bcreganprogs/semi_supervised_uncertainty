@@ -204,7 +204,7 @@ class VisionTransformer(nn.Module):
 
     def forward_encoder(self, x, mask_ratio):
         # embed patches
-        x = self.patch_embed(x)
+        x = self.patch_embed(x)  # [N, L, D]
 
         # add pos embed w/o cls token
         x = x + self.pos_embed[:, 1:, :]
@@ -363,9 +363,9 @@ class ViTAE(LightningModule):
 
     def _log_val_images(self, imgs: torch.Tensor, preds: torch.Tensor):
         grid = make_grid(imgs)
-        preds = preds.reshape(-1, 14, 14, 16, 16)
+        preds = preds.reshape(-1, 32, 32, 16, 16)
         preds = preds.permute(0, 1, 3, 2, 4)
-        preds = preds.reshape(-1, 1, 224, 224)
+        preds = preds.reshape(-1, 1, 512, 512)
         grid_val = make_grid(preds)
         self.logger.experiment.log({
             "Validation Images": [
@@ -376,9 +376,9 @@ class ViTAE(LightningModule):
 
     def _log_train_images(self, imgs: torch.Tensor, preds: torch.Tensor):
         grid = make_grid(imgs)
-        preds = preds.reshape(-1, 14, 14, 16, 16)
+        preds = preds.reshape(-1, 32, 32, 16, 16)
         preds = preds.permute(0, 1, 3, 2, 4)
-        preds = preds.reshape(-1, 1, 224, 224)
+        preds = preds.reshape(-1, 1, 512, 512)
         grid_val = make_grid(preds)
         self.logger.experiment.log({
             "Train Images": [

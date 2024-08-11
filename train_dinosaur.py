@@ -9,7 +9,7 @@ from pytorch_lightning.loggers import WandbLogger
 
 from models.mae.mae import ViTAE
 from models.dinosaur import DINOSAUR
-from models.data import JSRTDataModule, CheXpertDataModule, CLEVRNDataset
+from models.data import JSRTDataModule, CheXpertDataModule, CLEVRNDataset, SynthCardDataModule
 
 
 seed_everything(42, workers=True)
@@ -72,15 +72,17 @@ model2 = ViTAE(
     learning_rate=1e-4,
 )
 
-model = DINOSAUR(saved_model, model2, num_slots=6, num_iterations=3, num_classes=4, slot_dim=256, task='recon',
+oss = DINOSAUR(saved_model, model2, num_slots=6, num_iterations=3, num_classes=4, slot_dim=256, task='recon',
                                  learning_rate=4e-4, temperature=1, log_images=True, lr_warmup=True,
-                                 slot_attn_type='standard')
+                                 probabilistic_slots=False)
 
 #data = JSRTDataModule(data_dir='/vol/bitbucket/bc1623/project/semi_supervised_uncertainty/data/JSRT/', batch_size=64, augmentation=True)
 data = CheXpertDataModule(data_dir='/vol/biodata/data/chest_xray/CheXpert-v1.0/preproc_224x224/', batch_size=128, cache=True)
 #data = CLEVRNDataset(batch_size=32)
+#data = SynthCardDataModule(batch_size=128, rate_maps=0.2)
 
-wandb_logger = WandbLogger(save_dir='./runs/lightning_logs/dinosaur_recons/', project='dinosaur_recons')
+wandb_logger = WandbLogger(save_dir='./runs/lightning_logs/dinosaur_recons/', project='dinosaur_recons',
+                           name='chexpert_recon_mlp_decoder', id='chexpert_recon_mlp_decoder_3')
 output_dir = Path(f"dinosaur_recons/run_{wandb_logger.experiment.id}")  # type: ignore
 print("Saving to" + str(output_dir.absolute()))
 
@@ -88,7 +90,7 @@ trainer = Trainer(
     max_steps=250000,
     precision='16-mixed',
     accelerator='auto',
-    devices=[0, 1],
+    devices=[0],
     strategy='ddp_find_unused_parameters_true',
     # log_every_n_steps=250,
     val_check_interval=0.5,
@@ -99,4 +101,4 @@ trainer = Trainer(
 
 torch.set_float32_matmul_precision('medium')
 
-trainer.fit(model=model, datamodule=data)
+trainer.fit(model=oss, datamodule=data)
