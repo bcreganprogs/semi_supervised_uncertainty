@@ -8,78 +8,108 @@ from torch.optim.lr_scheduler import ReduceLROnPlateau, LambdaLR
 from pytorch_lightning import LightningModule
 import wandb
 
-from utils.utils import SoftPositionEmbed, spatial_broadcast, unstack_and_split, ConvCrossAttention
+from utils_local.utils import SoftPositionEmbed, spatial_broadcast, unstack_and_split
 from models.slot_attention import ProbabalisticSlotAttention, FixedSlotAttention, SlotAttention, FixedSlotAttentionMultiHead, FixedSlotAttentionMultiHeadProb
-from models.decoders import SlotSpecificDecoder, Decoder
+from models.decoders import CNNDecoder
+from models.transformers import TransformerDecoderImage
 
 class ObjectSpecificSegmentation(LightningModule):
-    def __init__(self, encoder, num_slots, num_iterations, num_classes, slot_dim=128, task='recon', include_seg_loss=False, slot_attn_type='standard', decoder_type='slot_specific', 
-                learning_rate=1e-3, image_chans=1, embedding_dim=768, image_resolution=224, softmax_class=True, temperature=1, freeze_encoder=False, lr_warmup=True, log_images=True,
-                embedding_shape=None, multi_truth=False, include_mlp=False, include_pos_embed=False):
+    def __init__(self, encoder, num_slots, num_iterations, num_classes, slot_dim=128, include_seg_loss=False, slot_attn_type='standard', probabilistic_sample: bool = True,
+                decoder_type='cnn', 
+                learning_rate=1e-3, image_chans=1, embedding_dim=768, image_resolution=224, temperature=1, freeze_encoder=False, lr_warmup=True, log_images=True,
+                embedding_shape=None, include_pos_embed=False, patch_size=16, num_patches=196,
+                slot_attn_heads=6, decoder_blocks=6, decoder_heads=6, decoder_dim=512, autoregressive=False, label_smoothing=0.0):
         super(ObjectSpecificSegmentation, self).__init__()
 
         self.encoder = encoder
-        self.embedding_shape = (image_resolution // 2**4, image_resolution // 2**4) if embedding_shape is None else embedding_shape#(image_resolution // 16, image_resolution // 16)
-        self.encoder_pos_embeddings = SoftPositionEmbed(embedding_dim, self.embedding_shape)
+        self.embedding_shape = (image_resolution // 2**4, image_resolution // 2**4) if embedding_shape is None else embedding_shape
+        self.encoder_pos_embed = nn.Parameter(torch.zeros(1, embedding_shape[0]*embedding_shape[1], embedding_dim))
+        nn.init.normal_(self.encoder_pos_embed, std=0.02)
 
         # slot attention
         if slot_attn_type == 'standard':
             self.slot_attention = SlotAttention(num_slots, slot_dim, num_iterations, temperature=temperature)
         elif slot_attn_type == 'probabilistic':
-            #self.slot_attention = ProbabalisticSlotAttention(num_slots=num_slots, dim=slot_dim, num_iterations=num_iterations, temperature=temperature)
-            self.slot_attention = FixedSlotAttentionMultiHeadProb(num_slots=num_slots, dim=slot_dim, num_iterations=num_iterations, temperature=temperature)
+            self.slot_attention = FixedSlotAttentionMultiHeadProb(num_slots=num_slots, slot_dim=slot_dim, input_dim=embedding_dim, num_iterations=num_iterations, temperature=temperature, num_heads=slot_attn_heads,
+            posterior_sample=probabilistic_sample)
         elif slot_attn_type == 'fixed':
-            self.slot_attention = FixedSlotAttention(num_slots=num_slots, dim=slot_dim, num_iterations=num_iterations, temperature=temperature)
+            self.slot_attention = FixedSlotAttention(num_slots=num_slots, slot_dim=slot_dim, input_dim=embedding_dim, num_iterations=num_iterations, temperature=temperature)
         else:
-            self.slot_attention = FixedSlotAttentionMultiHead(num_slots, slot_dim, num_iterations, temperature=temperature)
-        
-        #self.res_attention = ConvCrossAttention(64, 64)
+            self.slot_attention = FixedSlotAttentionMultiHead(num_slots, slot_dim, input_dim=embedding_dim, num_iterations=num_iterations, temperature=temperature, num_heads=slot_attn_heads)
             
         # decoder
         self.decoder_type = decoder_type
-        if decoder_type == 'slot_specific':
-            if task == 'recon':
-                self.decoder = SlotSpecificDecoder(slot_dim, num_slots, num_classes, include_recon=True, softmax_class=softmax_class, image_chans=image_chans, decoder_type='slot_specific',
-                                                   resolution=image_resolution)
+
+        if decoder_type == 'transformer':
+            self.patch_size = patch_size
+            self.num_patches = num_patches
+            self.decoder = TransformerDecoderImage(
+                decoder_blocks, num_patches, decoder_dim, num_heads=decoder_heads, dropout=0.0, num_cross_heads=None, patch_size=patch_size, out_chans=num_slots,
+                autoregressive=autoregressive)
+            self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
+            torch.nn.init.normal_(self.mask_token, std=0.02)
+            self.input_proj = nn.Sequential(
+                nn.Linear(decoder_dim, decoder_dim, bias=False),
+                nn.LayerNorm(decoder_dim),
+            )
+            self.input_proj.apply(self.init_weights)
+            self.slot_proj = nn.Sequential(
+                nn.Linear(slot_dim, decoder_dim, bias=False),
+                nn.LayerNorm(decoder_dim),
+            )
+            self.slot_proj.apply(self.init_weights)
+
+            self.spatial_conv = nn.Sequential(
+                nn.Conv2d(num_slots, num_slots * 8, kernel_size=5, padding=2),
+                nn.ReLU(),
+                nn.Conv2d(num_slots * 8, num_slots, kernel_size=3, padding=1),
+            )
+            self.spatial_conv.apply(self.init_weights)
+
+            self.autoregressive = autoregressive
+
+            if autoregressive:
+                self.permutations = [torch.arange((image_resolution // patch_size)**2)]
+                self.bos_token = nn.Parameter(torch.zeros(1, 1, embedding_dim)) # no first dim as only using 1 permutation
+                self.input_proj = nn.Sequential(
+                    nn.Linear(embedding_dim, decoder_dim, bias=False),
+                    nn.LayerNorm(decoder_dim),
+                )
+                # self.mask_token = nn.Parameter(torch.zeros(1, 1, decoder_dim))
+                torch.nn.init.normal_(self.bos_token, std=.02)
+                # torch.nn.init.normal_(self.mask_token, std=.02)
+                self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embedding_dim))
+                torch.nn.init.normal_(self.pos_embed, std=0.02)
             else:
-                self.decoder = SlotSpecificDecoder(slot_dim, num_slots, num_classes, include_recon=False, softmax_class=softmax_class, image_chans=image_chans, decoder_type='slot_specific',
-                                                   resolution=image_resolution)
+                self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, decoder_dim))
+                torch.nn.init.normal_(self.pos_embed, std=0.02)
+
         else:
-            self.decoder = SlotSpecificDecoder(slot_dim, num_slots, num_classes, include_recon=True, softmax_class=softmax_class, image_chans=image_chans, decoder_type='shared',
+            self.decoder = CNNDecoder(decoder_dim, slot_dim, num_slots, num_classes, image_chans=image_chans, decoder_type='shared',
                                                resolution=image_resolution)
-        self.decoder_pos_embeddings = SoftPositionEmbed(slot_dim, (8, 8))
+            self.decoder_pos_embeddings = nn.Parameter(torch.zeros(1, self.decoder.decoder_initial_size[0]*self.decoder.decoder_initial_size[1], slot_dim))
 
         # hyperparameters
         self.num_classes = num_classes
         self.num_slots = num_slots
+        self.slot_dim = slot_dim
         self.image_chans = image_chans
-        self.task = task
         self.learning_rate = learning_rate
         self.lr_warmup = lr_warmup
         self.embedding_norm = nn.LayerNorm(embedding_dim)
         self.include_seg_loss = include_seg_loss
         self.image_resolution = image_resolution
-        self.multi_truth = multi_truth
-        self.include_mlp = include_mlp
         self.include_pos_embed = include_pos_embed
-
-        # classification head
-        self.softmax_class = softmax_class
+        self.label_smoothing = label_smoothing
+        self.freeze_encoder = freeze_encoder
   
         if freeze_encoder:
+            encoder.eval()
             for param in self.encoder.parameters():
                 param.requires_grad = False
         else:
             for param in self.encoder.parameters():
                 param.requires_grad = True
-
-        if include_mlp:
-            self.mlp = nn.Sequential(
-                nn.Linear(embedding_dim, embedding_dim, bias=False),
-                nn.LeakyReLU(),
-                nn.Linear(embedding_dim, slot_dim, bias=False),
-            )
-            self.mlp.apply(self.init_weights)
 
         self.decoder.apply(self.init_weights)
         self.slot_attention.apply(self.init_weights)
@@ -110,78 +140,131 @@ class ObjectSpecificSegmentation(LightningModule):
     def forward(self, x):
         
         batch_size, num_channels, _, _ = x.size()
-        try:
-            patch_embeddings, _, _ = self.encoder.model.forward_encoder(x, 0.0)   # shape (batch_size, num_patches, embed_dim)
-            patch_embeddings = patch_embeddings[:, 1:, :]       # exclude cls token
+        # try:
+            #patch_embeddings, _, _ = self.encoder.model.forward_encoder(x, 0.0)   # shape (batch_size, num_patches, embed_dim)
+        encoder_type = type(self.encoder).__name__
+        if self.freeze_encoder:
+            with torch.no_grad():
+                # if x.shape[-1] % self.patch_size != 0:
+                #     x = nn.functional.pad(x, (0, self.patch_size - x.shape[-1] % self.patch_size, 0, self.patch_size - x.shape[-2] % self.patch_size), value=0)
+                # x = nn.functional.pad(x, (3, 3, 3, 3), value=0)
+                
+                if encoder_type.startswith('Dino'):
+                    patch_embeddings = self.encoder(x)
+                elif encoder_type.startswith('ViTAE'):
+                    patch_embeddings, _, _ = self.encoder.model.forward_encoder(x, 0.0)   # shape (batch_size, num_patches, embed_dim)
+                    patch_embeddings = patch_embeddings[:, 1:, :]       # exclude cls token
+                elif encoder_type.startswith('ResNet'):
+                    patch_embeddings = self.encoder(x)
+                    patch_embeddings = patch_embeddings.permute(0, 2, 3, 1) # shape (batch_size, 8, 8, embed_dim)
+                else:
+                    raise ValueError(f"Unsupported encoder type: {encoder_type}")
+                
+        else:
+            if encoder_type.startswith('Dino'):
+                patch_embeddings = self.encoder(x)
+            elif encoder_type.startswith('ViTAE'):
+                patch_embeddings, _, _ = self.encoder.model.forward_encoder(x, 0.0)   # shape (batch_size, num_patches, embed_dim)
+                patch_embeddings = patch_embeddings[:, 1:, :]       # exclude cls token
+            elif encoder_type.startswith('ResNet'):
+                patch_embeddings = self.encoder(x)
+                patch_embeddings = patch_embeddings.permute(0, 2, 3, 1) # shape (batch_size, 8, 8, embed_dim)
+            else:
+                raise ValueError(f"Unsupported encoder type: {encoder_type}")
             
-        except:
-            patch_embeddings, res_features = self.encoder(x)  # shape (batch_size, 256, 8, 8)
-            patch_embeddings = patch_embeddings.permute(0, 2, 3, 1) # shape (batch_size, 8, 8, embed_dim)
-
         # add position embeddings
         if self.include_pos_embed:
-            patch_embeddings = self.encoder_pos_embeddings(patch_embeddings)   # shape (batch_size, 14, 14, embed_dim)
-            #patch_embeddings = patch_embeddings.reshape(batch_size, int(self.embedding_shape[0] * self.embedding_shape[1]), -1)   # shape (batch_size, num_patches, embed_dim)
+            # reshape patch embeddings, flatten dim 1 and 
+            patch_embeddings = patch_embeddings.view(batch_size, -1, patch_embeddings.shape[-1])  # shape (batch_size, num_patches, embed_dim)
+            patch_embeddings = patch_embeddings + self.encoder_pos_embed.to(patch_embeddings.dtype)
         
-        if self.include_mlp:
-            patch_embeddings = self.embedding_norm(patch_embeddings)
-            patch_embeddings = patch_embeddings.view(patch_embeddings.shape[0], -1, patch_embeddings.shape[-1])  # shape (batch_size, num_patches, embed_dim)
-            patch_embeddings = self.mlp(patch_embeddings)  # shape (batch_size, 8, 8, embed_dim)
+        patch_embeddings = patch_embeddings.view(patch_embeddings.shape[0], -1, patch_embeddings.shape[-1])  # shape (batch_size, num_patches, embed_dim)
 
-        slots, attn = self.slot_attention(patch_embeddings)  # shape (batch_size, num_slots, slot_dim)
-        # perform high level slot attention here
+        slots, attn, sa_values = self.slot_attention(patch_embeddings)  # shape (batch_size, num_slots, slot_dim) sa_values is detached
         
-        #x = spatial_broadcast(slots, self.decoder.decoder_initial_size)  # shape (batch_size*num_slots, width_init, height_init, slot_dim)
-        # spatial broadcast
-        x = slots.view(-1, slots.shape[-1])[:, :, None, None]
-        x = x.repeat(1, 1, *self.decoder.decoder_initial_size)  # shape (batch_size*num_slots, slot_dim, width_init, height_init
-        x = x.permute(0, 2, 3, 1)  # shape (batch_size*num_slots, width_init, height_init, slot_dim)
-        
-        if self.task == 'recon':
-            x = self.decoder_pos_embeddings(x)
-            x = x.view(batch_size, self.num_slots, 8, 8, x.shape[-1]) # shape (batch_size, num_slots, 8, 8, slot_dim)
-            x = x.permute(0, 1, 4, 2, 3) # shape (batch_size, num_slots, slot_dim, width_init, height_init)
-            # = self.decoder_1(x).to(patch_embeddings.device)     # shape (batch_size, num_classes, H, W)
-            x = self.decoder.forward(x)  # shape (batch_size, num_classes, 224, 224)
+        if self.decoder_type == 'cnn':
+            # spatial broadcast
+            x = slots.view(-1, self.slot_dim).unsqueeze(-1).unsqueeze(-1)
+            h, w = self.decoder.decoder_initial_size
+            x = x.expand(-1, -1, h, w)  # shape: (batch_size * num_slots, slot_dim, h, w)
+            x = x.permute(0, 2, 3, 1).contiguous().view(-1, h * w, self.slot_dim) # shape: (batch_size * num_slots, h, w, slot_dim)
+            x = x + self.decoder_pos_embeddings.to(x.dtype)
+            x = x.view(batch_size, self.num_slots, h, w, self.slot_dim)
+            x = x.permute(0, 1, 4, 2, 3)
+            x = self.decoder(x)  # shape: (batch_size * num_slots, image_chans + 1, 224, 224)
+            decoded, masks = torch.split(x, [self.image_chans, 1], dim=2)  # shape: (batch_size * num_slots, image_chans, 224, 224), (batch_size * num_slots, 1, 224, 224)
+                
+        else:
+            if self.autoregressive:
+                bos_token = self.bos_token.expand(patch_embeddings.shape[0], -1, -1)
+                # mask_token = self.mask_token.expand(patch_embeddings.shape[0], -1, -1)
+                dec_input = torch.cat((bos_token, patch_embeddings[:, :-1, :]), dim=1)
 
-            #x = self.decoder.forward_2(x)  # shape (batch_size, num_classes, 224, 224)
-            # include high level features
-            decoded, masks = torch.split(x, [self.image_chans, 1], dim=2)
-            #decoded, vars, masks = torch.split(x, [self.image_chans, 1, 1], dim=2)
-            masks = F.softmax(masks, dim=1)         # softmax over self.num_slotslasses
+                dec_input = dec_input + self.pos_embed.to(patch_embeddings.dtype)
 
-            recons = torch.sum(decoded * masks, dim=1)
-            #vars = torch.sum(vars * masks, dim=1)
-            
-        else: # segmentation
-            if self.decoder_type == 'slot_specific':
-                x = self.decoder_pos_embeddings(x)     # shape (batch_size, num_classes, H, W)
-                x = x.view(batch_size, slots.shape[1], 8, 8, x.shape[-1])
-                x = x.permute(0, 1, 4, 2, 3)  # shape (batch_size, num_slots, slot_dim, width_init, height_init)
-                x = self.decoder_1(x)  # shape (batch_size, num_classes, 224, 224)
+                dec_input = self.input_proj(dec_input) # B, N, D
+                slots = self.slot_proj(slots) # B, K, D
 
-                # cross attention between x and high level features
-                #x = self.res_attention(x, res_features)
+                decoded, masks = self.decoder(dec_input, slots, causal_mask=True)      # shape (batch_size, num_slots, patches, h * w)
 
-                x = self.decoder_2(x)  # shape (batch_size, num_classes, 224, 224)
-                recons, masks = x, None
+                p = int(self.num_patches**0.5)  # number of patches in one dimension
+
+                decoded = decoded.view(batch_size, self.num_slots, p, p, self.patch_size, self.patch_size)
+                decoded = torch.einsum('nchwpq->nchpwq', decoded).contiguous()  # permute
+                decoded = decoded.view(batch_size, self.num_slots, p * self.patch_size, p * self.patch_size).unsqueeze(2)
+
+                masks = masks.view(batch_size * self.num_slots, p, p, self.patch_size, self.patch_size)
+                masks = torch.einsum('nhwpq->nhpwq', masks).contiguous()
+                masks = masks.view(-1, self.num_slots, p * self.patch_size, p * self.patch_size)
+
+                # spatial convolution
+                masks = self.spatial_conv(masks).unsqueeze(2)
+
             else:
-                x = self.decoder_pos_embeddings(x)     # shape (batch_size, num_classes, H, W)
-                x = self.decoder(x).to(patch_embeddings.device)     # shape (batch_size, num_classes, H, W)
-                decoded, masks = torch.split(x, [self.num_slots, 1], dim=2)
-                recons = decoded
-                masks = masks
+                #dec_input = sa_values.view(batch_size, -1, self.slot_dim) # B, N, D 
+                dec_input = self.mask_token.expand(batch_size * self.num_slots, -1, -1)
+                # add position embeddings
+                dec_input = dec_input + self.pos_embed.to(patch_embeddings.dtype)
 
-        return recons, masks, attn  #recons, vars, masks, attn
+                dec_input = self.input_proj(dec_input) # B, N, D
+                
+                slots = slots.view(-1, self.slot_dim).unsqueeze(1)                      # shape (batch_size * num_slots, 1, D)
+                slots = self.slot_proj(slots)
+
+                decoded, masks = self.decoder(dec_input, slots, causal_mask=False)      # shape (batch_size * num_slots, patches, h * w)
+                
+                p = int(self.num_patches**0.5)  # number of patches in one dimension
+
+                decoded = decoded.view(batch_size * self.num_slots, p, p, self.patch_size, self.patch_size)
+                decoded = torch.einsum('nhwpq->nhpwq', decoded).contiguous()
+                decoded = decoded.view(-1, self.num_slots, p * self.patch_size, p * self.patch_size).unsqueeze(2)
+
+                masks = masks.view(batch_size * self.num_slots, p, p, self.patch_size, self.patch_size)
+                masks = torch.einsum('nhwpq->nhpwq', masks).contiguous()
+                masks = masks.view(-1, self.num_slots, p * self.patch_size, p * self.patch_size)
+
+                # spatial convolution
+                masks = self.spatial_conv(masks).unsqueeze(2)
+        
+        logits = masks.clone()
+
+        masks = F.softmax(masks, dim=1)         # softmax over slots
+
+        # check if nan in masks and decoded
+        recons = torch.sum(decoded * masks, dim=1)
+        recons = torch.sigmoid(recons)
+
+        return recons, masks, logits, attn  
     
     def init_weights(self, m):
-        if isinstance(m, (nn.Linear, nn.Conv2d, nn.Parameter)):
+        if isinstance(m, (nn.Linear, nn.Conv2d, nn.Parameter, nn.ConvTranspose2d)):
             nn.init.xavier_uniform_(m.weight)
             if m.bias is not None:
                 nn.init.zeros_(m.bias)
     
     def configure_optimizers(self):
-        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate)#, weight_decay=1e-6)
+        optimizer = torch.optim.Adam(self.parameters(), lr=self.learning_rate, weight_decay=1e-6)
+        
         if not self.lr_warmup:
             return optimizer
 
@@ -196,6 +279,41 @@ class ObjectSpecificSegmentation(LightningModule):
             #     #"strict": True,
              },
         }
+
+    # def configure_optimizers(self):
+    #     # Define the parameters for Slot Attention with a specific learning rate
+    #     slot_attention_params = {
+    #         "params": self.slot_attention.parameters(),  # Adjust this to the correct attribute name
+    #         "lr": 1e-5
+    #     }
+
+    #     # Define the parameters for the rest of the model with the standard learning rate
+    #     other_params = {
+    #         "params": [param for name, param in self.named_parameters() if "slot_attention" not in name],
+    #         "lr": self.learning_rate
+    #     }
+
+    #     # Create the optimizer with the two parameter groups
+    #     optimizer = torch.optim.Adam(
+    #         [slot_attention_params, other_params]
+    #     )
+
+    #     return optimizer
+
+    #     if not self.lr_warmup:
+    #         return optimizer
+
+    #     # Set up the learning rate scheduler if warmup is enabled
+    #     scheduler = self.warmup_lr_scheduler(optimizer, 10000, 50000, 1e-6, self.learning_rate)
+    #     return {
+    #         "optimizer": optimizer,
+    #         "lr_scheduler": {
+    #             "scheduler": scheduler,
+    #             "frequency": 1,
+    #             "interval": "step",
+    #         },
+    #     }
+
     
     def warmup_lr_scheduler(self, optimizer, warmup_steps, decay_steps, start_lr, target_lr):
         def lr_lambda(current_step):
@@ -204,78 +322,67 @@ class ObjectSpecificSegmentation(LightningModule):
             else:
                 return 0.5 ** ((current_step - warmup_steps) / decay_steps)
         return LambdaLR(optimizer, lr_lambda)
-    
-    # def mask_entropy(self, masks):
-
-    #     entropy = -(masks * torch.log(masks + 1e-6)).sum(dim=[1, 2]).mean()
-    #     return -entropy
-    
-    # def min_area_loss(self, masks, min_area_ratio=0.02):
-    #     areas = masks.sum(dim=[2, 3]) / (masks.shape[2] * masks.shape[3])
-    #     return F.relu(min_area_ratio - areas).mean()
-    
-    # def mask_exclusivity_loss(self, masks):
-    #     b, n, h, w = masks.squeeze().shape
-    #     masks_flat = masks.view(b, n, -1)
-        
-    #     # Calculate L1 distance between masks at each spatial location
-    #     distances = torch.abs(masks_flat.unsqueeze(2) - masks_flat.unsqueeze(1))
-        
-    #     # We want to maximize this distance, so we minimize its negative
-    #     return -distances.mean()
 
     def process_batch(self, batch, batch_idx):
-
-        if self.task == 'recon':
-            if self.include_seg_loss:
-                x, y = batch['image'], batch['labelmap']
-                # select random from second dimension
-                y = y[:, torch.randint(0, y.shape[1], (1,))]
-            else:
-                x = batch['image']
-            
-            x = x.float() 
-
-            recons, masks, attn = self(x)
-            if self.softmax_class:
-                mask_probs = torch.softmax(masks, dim=1)
-                preds = torch.argmax(mask_probs, dim=1)
-            else: # use mlp predictor
-                mask_probs = masks
-                preds = torch.round(mask_probs)
-
-
-            recon_loss = F.mse_loss(recons.squeeze(), x.squeeze()) #+ 0.0001*mask_div_loss      #recon loss
-
-            if self.include_seg_loss:
-                loss = 1.0 * recon_loss #+ mask_entropy
-                # only consider masks and y for which y is not all zeros
-                # indices = torch.where(y.squeeze().sum(dim=(1, 2)) > 0)[0]
-                # loss_masks = masks[indices]
-                # y = y[indices]
-  
-                # if  y is not empty
-                # if len(indices) > 0:
-                seg_loss = F.cross_entropy(masks, y, reduction='mean')     # segmentation loss
-                loss += seg_loss 
-                #preds = preds[indices]
-                dsc = dice(preds, y, average='macro', num_classes=self.num_classes, ignore_index=0)
-                # else:
-                #     dsc = 0
-            else:
-                loss = recon_loss #+ mask_entropy
-                dsc = 0
-
-            probs = torch.softmax(recons, dim=1)
-            
-        else:
+        if self.include_seg_loss:
             x, y = batch['image'], batch['labelmap']
-            logits, masks, attn = self(x)
-            loss = F.cross_entropy(logits, y.squeeze())
-            probs = torch.softmax(logits, dim=1)
-            preds = torch.argmax(probs, dim=1)
+            # select random from second dimension
+            y = y[:, torch.randint(0, y.shape[1], (1,))]
+
+            if 'ground_truth' in batch.keys():
+                gt = batch['ground_truth']
+            else:
+                gt = None
+        else:
+            x = batch['image']
+        
+        x = x.float() 
+
+        recons, masks, logits, attn = self(x)
+        
+        mask_probs = logits[:, :self.num_classes]
+        mask_probs[:, 0] = mask_probs[:, 0] + torch.sum(logits[:, self.num_classes:], dim=1)  # add background class to background mask
+
+        preds = torch.argmax(masks, dim=1)
+        preds[preds > (self.num_classes - 1)] = 0
+
+        recon_loss = F.mse_loss(recons.squeeze(), x.squeeze()) 
+
+        if self.include_seg_loss:
+            loss = 0.1 * recon_loss
+            # only consider masks and y for which y is not all zeros
+            # indices = torch.where(y.squeeze().sum(dim=(1, 2)) > 0)[0]
+            # loss_masks = masks[indices]
+            # y = y[indices]
+
+            # if  y is not empty
+            # if len(indices) > 0:
+            # mask_probs = mask_probs[:, 3:-3, 3:-3]
+
+            # clip to avoid nan
+            mask_probs = torch.clamp(mask_probs, -10, 10)
+            seg_loss = F.cross_entropy(mask_probs, y, reduction='mean', label_smoothing=self.label_smoothing)#, ignore_index=0)     # segmentation loss
+
+            loss += seg_loss 
+            #preds = preds[indices]
+            if gt is not None:
+                dsc = dice(preds, gt, average='macro', num_classes=self.num_classes, ignore_index=0)
+            else:
+                dsc = dice(preds, y, average='macro', num_classes=self.num_classes, ignore_index=0)
+        else:
+            loss = recon_loss
+            dsc = 0
+
+        probs = torch.softmax(recons, dim=1)
+            
+        # else:
+        #     x, y = batch['image'], batch['labelmap']
+        #     logits, masks, logits, attn = self(x)
+        #     loss = F.cross_entropy(logits, y.squeeze())
+        #     probs = torch.softmax(logits, dim=1)
+        #     preds = torch.argmax(probs, dim=1)
   
-            dsc = dice(preds, y.squeeze(), average='macro', num_classes=self.num_classes, ignore_index=0)
+        #     dsc = dice(preds, y.squeeze(), average='macro', num_classes=self.num_classes, ignore_index=0)
 
         return loss, dsc, probs, preds, x, recons, masks, attn
 
@@ -299,11 +406,13 @@ class ObjectSpecificSegmentation(LightningModule):
         self.log("val_dice", dsc, prog_bar=True, sync_dist=True)
 
         if self.val_imgs is None:
-            self.val_imgs = imgs[:5].cpu()
-            self.val_preds = preds[:5].cpu()
-            self.val_recons = recons[:5].cpu()
-            self.val_masks = masks[:5].cpu()
-            self.val_attn = attn[:5].cpu()
+            # randomly select 5 images to log
+            indices = torch.randint(0, imgs.shape[0], (5,))
+            self.val_imgs = imgs[indices].cpu()
+            self.val_preds = preds[indices].cpu()
+            self.val_recons = recons[indices].cpu()
+            self.val_masks = masks[indices].cpu()
+            self.val_attn = attn[indices].cpu()
 
     def on_test_start(self):
         self.test_probmaps = []
@@ -348,9 +457,9 @@ class ObjectSpecificSegmentation(LightningModule):
 
     def _log_val_images(self):
         imgs, preds, recons, masks, attn = self.val_imgs, self.val_preds, self.val_recons, self.val_masks, self.val_attn
+        # print(masks.shape, recons.shape) # shape (5, num_slots, res, res) (5, res, res)
         grid = make_grid(imgs)
-        grid_val = make_grid(masks[0]).float()
-        #make_grid(preds).float()
+        grid_val = make_grid(masks[0].view(self.num_slots, 1, self.image_resolution, self.image_resolution), nrow=self.num_slots).float()
         grid_recons = make_grid(recons).float()
         self.logger.experiment.log({
             "Validation Images": [
@@ -358,20 +467,21 @@ class ObjectSpecificSegmentation(LightningModule):
                 wandb.Image(grid_val, caption="Masks"),
                 wandb.Image(grid_recons, caption="Reconstructed Images")
             ],
+            "trainer/global_step": self.global_step,
         })
 
     def _log_train_images(self):
         imgs, preds, recons, masks, attn = self.train_imgs, self.train_preds, self.train_recons, self.train_masks, self.train_attn
         grid = make_grid(imgs)
-        grid_val = make_grid(masks[0]).float()
-        #make_grid(preds).float()
+        grid_val = make_grid(masks[0].view(self.num_slots, 1, self.image_resolution, self.image_resolution), nrow=self.num_slots).float()
         grid_recons = make_grid(recons).float()
         self.logger.experiment.log({
             "Train Images": [
                 wandb.Image(grid, caption="Original Images"),
                 wandb.Image(grid_val, caption="Masks"),
-                wandb.Image(grid_recons, caption="Reconstructed Images")
+                wandb.Image(grid_recons, caption="Reconstructed Images"),
             ],
+            "trainer/global_step": self.global_step,
         })
 
     def _log_key_images(self):
@@ -379,18 +489,30 @@ class ObjectSpecificSegmentation(LightningModule):
         recons_grid = make_grid(recons)
         #print(attn.shape) #attn shape (batch_size, num_slots, embedding_shape[0], embedding_shape[1])
         attn = attn.reshape(-1, self.num_slots, self.embedding_shape[0], self.embedding_shape[1])
-        attn_maps = make_grid(attn.reshape(-1, 1, self.embedding_shape[0], self.embedding_shape[1]), nrow=self.num_slots)
-        masks = make_grid(masks.reshape(-1, 1, self.embedding_shape[0], self.embedding_shape[1]), nrow=self.num_slots).float()
+        attn_neg = 1 - attn
+        attn = F.interpolate(attn, size=(self.image_resolution, self.image_resolution), mode='nearest')
+        attn_neg = F.interpolate(attn_neg, size=(self.image_resolution, self.image_resolution), mode='nearest')
+        attn_maps = make_grid(attn.reshape(-1, 1, self.image_resolution, self.image_resolution), nrow=self.num_slots)
+        attn_neg_maps = make_grid(attn_neg.reshape(-1, 1, self.image_resolution, self.image_resolution), nrow=self.num_slots)
+        # masks = make_grid(masks.reshape(-1, 1, self.image_resolution, self.image_resolution), nrow=self.num_slots).float()
    
         self.logger.experiment.log({
             "Reconstructed Images": [
                 wandb.Image(recons_grid, caption="Reconstructed Images"),
             ],
+            "trainer/global_step": self.global_step,
+        })
+        self.logger.experiment.log({
+            "Slot Attention Neg Maps": [
+                wandb.Image(attn_neg_maps, caption="Attention Maps"),
+            ],
+            "trainer/global_step": self.global_step,
         })
         self.logger.experiment.log({
             "Slot Attention Maps": [
                 wandb.Image(attn_maps, caption="Attention Maps"),
             ],
+            "trainer/global_step": self.global_step,
         })
         # self.logger.experiment.log({
         #     "Masks": [

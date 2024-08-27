@@ -1,214 +1,207 @@
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
-
-from utils.utils import SoftPositionEmbed
-
+from utils_local.utils import SoftPositionEmbed
 import math
 from typing import Callable, Dict, Optional, Tuple, Union
     
 class ConvBlock(nn.Module):
-    def __init__(self, in_channels, out_channels):
+    def __init__(self, in_channels, out_channels, end_relu=True):
         super(ConvBlock, self).__init__()
 
-        self.conv = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(),
-        )
+        if end_relu:
+            self.conv = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_channels),
+                nn.ReLU(inplace=True),
+            )
+        else:
+            self.conv = nn.Sequential(
+                nn.Conv2d(in_channels, out_channels, kernel_size=3, padding=1),
+                nn.BatchNorm2d(out_channels),
+            )
 
     def forward(self, x):
         return self.conv(x)
 
-class Upsample(nn.Module):
+class ResBlock(nn.Module):
     def __init__(self, in_channels, out_channels):
+        super(ResBlock, self).__init__()
+
+        self.conv = nn.Sequential(
+            ConvBlock(in_channels, out_channels),
+            ConvBlock(out_channels, out_channels, end_relu=False),
+        )
+
+        self.skip_conv = nn.Conv2d(in_channels, out_channels, kernel_size=1) if in_channels != out_channels else None
+
+        self.output = nn.Sequential(
+            nn.BatchNorm2d(out_channels),
+            nn.ReLU(inplace=True)
+        )
+
+        self.ca = ChannelAttention(out_channels)
+        self.sa = SpatialAttention()
+
+    def forward(self, x):
+
+        skip = x
+
+        x = self.conv(x)
+
+        x = self.ca(x) * x
+        x = self.sa(x) * x
+
+        if self.skip_conv is not None:
+            skip = self.skip_conv(skip)
+
+        return self.output(x + skip)
+        # return x + skip
+
+class ECA(nn.Module):
+    """Version from from https://wandb.ai/diganta/ECANet-sweep/reports/Efficient-Channel-Attention--VmlldzozNzgwOTE
+    Constructs a ECA module.
+
+
+    Args:
+        channels: Number of channels in the input tensor
+        b: Hyper-parameter for adaptive kernel size formulation. Default: 1
+        gamma: Hyper-parameter for adaptive kernel size formulation. Default: 2 
+    """
+    def __init__(self, channels, b=1, gamma=2):
+        super(ECA, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.channels = channels
+        self.b = b
+        self.gamma = gamma
+        self.conv = nn.Conv1d(1, 1, kernel_size=self.kernel_size(), padding=(self.kernel_size() - 1) // 2, bias=False) 
+        self.sigmoid = nn.Sigmoid()
+
+    def kernel_size(self):
+        k = int(abs((math.log2(self.channels)/self.gamma)+ self.b/self.gamma))
+        out = k if k % 2 else k+1
+        return out
+
+    def forward(self, x):
+
+        # feature descriptor on the global spatial information
+        y = self.avg_pool(x)
+
+        # Two different branches of ECA module
+        y = self.conv(y.squeeze(-1).transpose(-1, -2)).transpose(-1, -2).unsqueeze(-1)
+
+        # Multi-scale information fusion
+        y = self.sigmoid(y)
+
+        return x * y.expand_as(x)
+
+class ChannelAttention(nn.Module):
+    """From https://github.com/luuuyi/CBAM.PyTorch/blob/master/model/resnet_cbam.py"""
+    def __init__(self, in_chans, ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
+           
+        self.fc = nn.Sequential(nn.Conv2d(in_chans, in_chans // 16, 1, bias=False),
+                               nn.ReLU(),
+                               nn.Conv2d(in_chans // 16, in_chans, 1, bias=False))
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+class SpatialAttention(nn.Module):
+    """From https://github.com/luuuyi/CBAM.PyTorch/blob/master/model/resnet_cbam.py"""
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+
+        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        x = torch.cat([avg_out, max_out], dim=1)
+        x = self.conv1(x)
+        return self.sigmoid(x)
+
+class Upsample(nn.Module):
+    def __init__(self, in_channels, out_channels, size=None):
         super(Upsample, self).__init__()
 
-        self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
-        self.conv = ConvBlock(in_channels, out_channels)
+        # if size is not None:
+        #     self.upsample = nn.Upsample(size=size, mode='bilinear', align_corners=False)
+        # else:
+        #     self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
+        self.upsample = nn.Sequential(
+            nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1),
+            # nn.BatchNorm2d(in_channels),
+            # nn.ReLU(inplace=True),
+        )
+
+        self.conv = ConvBlock(in_channels, out_channels, end_relu=True)      #ResBlock(in_channels, out_channels)
+
 
     def forward(self, x):
+        
         x = self.upsample(x)
         x = self.conv(x)
-        return x
+
+        return x  
     
-class Downsample(nn.Module):
-    def __init__(self, in_channels, out_channels):
-        super(Downsample, self).__init__()
-
-        self.downsample = nn.Sequential(
-            ConvBlock(in_channels, out_channels),
-            nn.MaxPool2d(2)            
-        )
-
-    def forward(self, x):
-        return self.downsample(x)
-
-
-class Decoder(nn.Module):
-    """Decoder to transform each slot to a 2D feature map."""
-    def __init__(self, slot_dim, num_slots, num_classes, num_channels=1, initial_size=(8, 8)):
-        super().__init__()
-        self.slot_dim = slot_dim
-        self.num_slots = num_slots
-        self.num_classes = num_classes
-        self.num_channels = num_channels
-
-        self.decoder_initial_size = initial_size
-        self.decoder_pos_embeddings = SoftPositionEmbed(slot_dim, self.decoder_initial_size)
-        
-        self.conv1 = Upsample(slot_dim, 256)
-        self.mid_downsample = nn.Conv2d(256, 256, kernel_size=3, padding=0)
-        self.conv2 = Upsample(256, 128)
-        self.conv3 = Upsample(128, 128)
-        self.conv4 = ConvBlock(128, 64)
-        self.conv5 = Upsample(64, 32)
-        self.conv6 = Upsample(32, 16)
-        self.end_conv = nn.Conv2d(16, num_channels + 1, kernel_size=3, padding=1)
-
-        self.final_conv = nn.Sequential(
-            #nn.BatchNorm2d(num_slots),
-            nn.Conv2d(num_slots, num_classes, kernel_size=1)
-        )
-
-
-    def forward(self, x):
-        # input, x has shape (batch_size * num_slots, init_height, init_width, slot_dim)
-   
-        #x = self.decoder_pos_embeddings(x)   # (batch_size * num_slots, init_height, init_width, slot_dim)
-
-        x = x.permute(0, 3, 1, 2)   # (batch_size * num_slots, slot_dim, init_height, init_width)
-        #x = self.fc(x)
-        x = self.conv1(x)   # (batch_size * num_slots, 512, 16, 16)
-        x = self.mid_downsample(x)   # (batch_size * num_slots, 512, 14, 14)
-        x = self.conv2(x)   # (batch_size * num_slots, 256, 28, 28)
-        x = self.conv3(x)   # (batch_size * num_slots, 128, 56, 56)
-        x = self.conv4(x)   # (batch_size * num_slots, 64, 112, 112)
-        x = self.conv5(x)   # (batch_size * num_slots, 32, 224, 224)
-        x = self.conv6(x)   # (batch_size * num_slots, 16, 224, 224)
-        x = self.end_conv(x)   # (batch_size * num_slots, num_classes, 224, 224)
-        x = F.relu(x)
-
-        x = x.reshape(-1, self.num_slots,  self.num_channels + 1, 224, 224)   # (batch_size, num_slots, num_channels, 224, 224)
-
-        #x = x.squeeze()   # (batch_size, num_slots, 224, 224)
-       
-        # if self.num_slots > self.num_classes:
-        #     x = self.final_conv(x)
-
-        return x
-    
-    
-class SlotSpecificDecoder(nn.Module):
-    """Decoder to transform each slot to a 2D feature map.
-    This version has a separate decoder for each slot."""
-    def __init__(self, slot_dim, num_slots, num_classes, include_recon=False, softmax_class=True, resolution=224,
+class CNNDecoder(nn.Module):
+    """Additive CNN Decoder."""
+    def __init__(self, dim, slot_dim, num_slots, num_classes, resolution=224,
                  image_chans=1, decoder_type='slot_specific'):
         super().__init__()
+        self.dim = dim
         self.slot_dim = slot_dim
         self.num_slots = num_slots
         self.num_classes = num_classes
         self.resolution = resolution
-        self.include_recon = include_recon
-        self.softmax_class = softmax_class
         self.image_chans = image_chans
         self.decoder_type = decoder_type
         self.decoder_initial_size = (8, 8)
-        self.decoder_pos_embeddings = SoftPositionEmbed(slot_dim, self.decoder_initial_size)
-
-        if decoder_type == 'slot_specific':
-            self.start_decoder = nn.ModuleList([self.make_start_decoder() for _ in range(num_slots)])
-            self.end_decoder = nn.ModuleList([self.make_end_decoder() for _ in range(num_slots)])
-        elif decoder_type == 'shared':
-            self.start_decoder = self.make_start_decoder()
-            self.end_decoder = self.make_end_decoder()
-
+        self.decoder = self.make_decoder()
         self.training = True
 
-        # self.final_conv = nn.Sequential(
-        #     nn.BatchNorm2d(num_slots),
-        #     nn.Conv2d(num_slots*2, num_classes*2, kernel_size=1),
-        #     nn.ReLU()
-        # )
+    def make_decoder(self):
+        layers = [
+            ConvBlock(self.slot_dim, self.dim, end_relu=True), # 8, 8
+            Upsample(self.dim, self.dim, size=(16, 16)), # 16, 16
+            Upsample(self.dim, self.dim, size=(32, 32)), # 32, 32
+            Upsample(self.dim, self.dim, size=(64, 64)), # 64, 64
+            Upsample(self.dim, 64, size=(128, 128)), # 128, 128
+        ]
+        if self.resolution > 128 and self.resolution <= 256:
+            layers.append(Upsample(64, 64, size=(self.resolution, self.resolution))) # 256, 256
+        elif self.resolution > 128:
+            layers.append(Upsample(64, 64, size=(256, 256)))
+        if self.resolution > 256:
+            layers.append(Upsample(64, 64, size=(self.resolution, self.resolution))) # 512, 512
+       
+        layers.append(nn.Conv2d(64, 64, kernel_size=5, padding=2)) # no batch norm
+        layers.append(nn.ReLU(inplace=True))
+        layers.append(nn.Conv2d(64, self.image_chans + 1, kernel_size=3, padding=1))
 
-    def make_start_decoder(self):
-        return nn.Sequential(
-            ConvBlock(self.slot_dim, 1024),   # (batch_size, 512, 8, 8) # 64
-            Upsample(1024, 512),   # (batch_size, 256, 16, 16) # 64
-            Upsample(512, 256),   # (batch_size, 128, 28, 28) # 64
-            Upsample(256, 128),   # (batch_size, 64, 56, 56) # 64
-            Upsample(128, 64),   # (batch_size, 32, 112, 112) #32
-        )
-    
-    def make_end_decoder(self):
-        if not self.include_recon:
-            return nn.Sequential(
-                 # 128 + 64 
-                Upsample(64, 32),   # (batch_size, 32, 112, 112) #32
-                Upsample(32, 16),    # (batch_size, 16, 2216, 224) # 8
-                nn.Conv2d(16, self.image_chans, kernel_size=3, padding=1),   # (batch_size, 1, 224, 224)
-            )
-        else:
-            return nn.Sequential(
-                #Upsample(64, 64),  # 192
-                Upsample(64, 32),   # (batch_size, 16, 112, 112)
-                Upsample(32, 16),    # (batch_size, 8, 2216, 224)
-                nn.Conv2d(16, self.image_chans + 1, kernel_size=3, padding=1),   # (batch_size, 1, 224, 224)
-            )
+        return nn.Sequential(*layers)
 
-    # def make_start_decoder(self):
-    #     return nn.Sequential(
-    #         #ConvBlock(self.slot_dim, 512),   # (batch_size, 512, 8, 8) # 64
-    #         Upsample(self.slot_dim, 64),   # (batch_size, 256, 16, 16) # 64
-    #         # reduce from 16x16 to 14x14
-    #         # nn.Conv2d(256, 256, kernel_size=3, padding=0),   # (batch_size, 256, 14, 14)
-    #         # nn.BatchNorm2d(256),
-    #         # nn.ReLU(),
-    #         Upsample(64, 32),   # (batch_size, 128, 28, 28) # 64
-    #         Upsample(32, 16),   # (batch_size, 64, 56, 56) # 64
-    #     )
-    
-    # def make_end_decoder(self):
-    #     if not self.include_recon:
-    #         return nn.Sequential(
-    #              # 128 + 64 
-    #             Upsample(16, 8),   # (batch_size, 32, 112, 112) #32
-    #             Upsample(8, 4),    # (batch_size, 16, 224, 224) # 8
-    #             nn.Conv2d(4, self.image_chans, kernel_size=3, padding=1),   # (batch_size, 1, 224, 224)
-    #         )
-    #     else:
-    #         return nn.Sequential(
-    #             #Upsample(128, 64),  # 192
-    #             Upsample(16, 8),   # (batch_size, 16, 112, 112)
-    #             Upsample(8, 4),    # (batch_size, 8, 224, 224)
-    #             nn.Conv2d(4, self.image_chans + 1, kernel_size=3, padding=1),   # (batch_size, 1, 224, 224)
-    #         )
-
-    def forward(self, x, res_feats=None):
+    def forward(self, x):
         batch_size, num_slots, slot_dim, init_height, init_width = x.size()
     
-        x1 = self.start_decoder(x.view(-1, slot_dim, init_height, init_width))
-
-        # concat res feats
-        # dropout res_feats
-        # res_feats = F.dropout(res_feats, p=0.5, training=self.training)
-        # res_feats = res_feats.repeat(num_slots, 1, 1, 1)
-      
-        # # repeat batch dimension by number of slots
+        x = x.view(-1, slot_dim, init_height, init_width)
         
-        # x1 = torch.cat([x1, res_feats], dim=1) # concatenated along the channel dimension
+        x = self.decoder(x)
 
-        x2 = self.end_decoder(x1)
+        # crop to match resolution
+        x = x[:, :, :self.resolution, :self.resolution]
 
-        x2 = x2[:, :, :self.resolution, :self.resolution]
+        x = x.view(batch_size, num_slots, self.image_chans + 1, self.resolution, self.resolution)
 
-        if not self.include_recon:
-            x2 = x2.squeeze()   # (batch_size, num_classes, self.resolution, self.resolution)
-            x2 = x2.view(batch_size, self.num_classes, self.resolution, self.resolution)
-        else:
-            x2 = x2.view(batch_size, self.num_slots, self.image_chans + 1, self.resolution, self.resolution)
-
-        return x2
+        return x
     
 # Code taken from spot https://github.com/gkakogeorgiou/spot/blob/master/mlp.py and is based on 
 # https://github.com/amazon-science/object-centric-learning-framework/blob/main/ocl

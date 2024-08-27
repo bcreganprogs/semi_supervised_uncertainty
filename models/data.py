@@ -103,7 +103,7 @@ class JSRTDataset(Dataset):
         return {'image': image, 'labelmap': labelmap}
     
 class JSRTDataModule(LightningDataModule):
-    def __init__(self, data_dir: str = './data/JSRT/', batch_size: int = 5, num_workers: int = 4, augmentation: bool = False):
+    def __init__(self, data_dir: str = './data/JSRT/', batch_size: int = 5, num_workers: int = 4, augmentation: bool = False, random_seed: int = 42):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
@@ -115,8 +115,8 @@ class JSRTDataModule(LightningDataModule):
             download_JRST(data_dir)
 
         self.data = pd.read_csv(os.path.join(self.data_dir, 'jsrt_metadata.csv'))
-        dev, self.test_data = train_test_split(self.data, test_size=0.1)
-        self.train_data, self.val_data = train_test_split(dev, test_size=0.05)
+        dev, self.test_data = train_test_split(self.data, test_size=0.1, random_state=random_seed)
+        self.train_data, self.val_data = train_test_split(dev, test_size=0.05, random_state=random_seed)
 
         self.train_set = JSRTDataset(self.train_data, self.data_dir, augmentation=augmentation)
         self.val_set = JSRTDataset(self.val_data, self.data_dir, augmentation=False)
@@ -217,7 +217,8 @@ class CheXpertDataset(Dataset):
         return image#{'image': image}
     
 class CheXpertDataModule(LightningDataModule):
-    def __init__(self, data_dir: str = 'vol/biodata/data/chest_xray/CheXpert-v1.0/preproc_224x224/', batch_size: int = 32, num_workers: int = 6, cache: bool = False):
+    def __init__(self, data_dir: str = 'vol/biodata/data/chest_xray/CheXpert-v1.0/preproc_224x224/', batch_size: int = 32, num_workers: int = 12, cache: bool = False, 
+        augmentation: bool = False, random_seed: int = 42):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
@@ -229,10 +230,10 @@ class CheXpertDataModule(LightningDataModule):
 
         files = os.listdir(data_dir)      # pd.read_csv(os.path.join(self.data_dir, 'data_incl_224.csv'))
         self.data = [os.path.join(data_dir, file) for file in files]
-        dev, self.test_data = train_test_split(self.data, test_size=0.2)
-        self.train_data, self.val_data = train_test_split(dev, test_size=0.05)
+        dev, self.test_data = train_test_split(self.data, test_size=0.2, random_state=random_seed)
+        self.train_data, self.val_data = train_test_split(dev, test_size=0.05, random_state=random_seed)
 
-        self.train_set = CheXpertDataset(self.train_data, self.data_dir, augmentation=True, cache=cache)
+        self.train_set = CheXpertDataset(self.train_data, self.data_dir, augmentation=augmentation, cache=cache)
         self.val_set = CheXpertDataset(self.val_data, self.data_dir, augmentation=False, cache=cache)
         self.test_set = CheXpertDataset(self.test_data, self.data_dir, augmentation=False, cache=cache)
 
@@ -256,15 +257,21 @@ class SynthCardDataset(Dataset):
         self.cache = cache
         self.rate_maps = rate_maps
 
-        if cache:
-            self.cache = SharedCache(
-                size_limit_gib=24,
-                dataset_len=len(self.data),
-                data_dims=[1, 128, 128],
-                dtype=torch.float32,
-            )
-        else:
-            self.cache = None
+        # if cache:
+        #     self.image_cache = SharedCache(
+        #         size_limit_gib=2,
+        #         dataset_len=len(self.data),
+        #         data_dims=[1, 128, 128],
+        #         dtype=torch.float32,        
+        #     )
+        #     self.label_cache = SharedCache(
+        #         size_limit_gib=2,
+        #         dataset_len=len(self.data),
+        #         data_dims=[5, 128, 128],
+        #         dtype=torch.uint8,
+        #     )
+        # else:
+        self.cache = None
 
         # photometric data augmentation
         #self.photometric_augment = transforms.Compose([
@@ -276,12 +283,12 @@ class SynthCardDataset(Dataset):
 
         # geometric data augmentation
         self.geometric_augment = transforms.Compose([
-            transforms.RandomApply(transforms=[transforms.RandomAffine(degrees=5, scale=(0.9, 1.1), interpolation=transforms.InterpolationMode.NEAREST)], 
+            transforms.RandomApply(transforms=[transforms.RandomAffine(degrees=5, scale=(0.9, 1.0), interpolation=transforms.InterpolationMode.NEAREST)], 
                                                 p = 0.5),
-            transforms.RandomRotation(15),
-            transforms.RandomApply(transforms=[transforms.RandomResizedCrop(128, scale=(0.8, 1.0), ratio=(0.75, 1.1))] , p=0.3),
-            #transforms.RandomHorizontalFlip(p=0.3), 
-            #transforms.RandomVerticalFlip(p=0.3),
+            #transforms.RandomRotation(15),
+            transforms.RandomApply(transforms=[transforms.RandomResizedCrop(128, scale=(0.8, 1.0), ratio=(0.75, 1.0))] , p=0.3),
+            transforms.RandomHorizontalFlip(p=0.3), 
+            transforms.RandomVerticalFlip(p=0.3),
         ])
 
         # collect samples (file paths) from dataset
@@ -296,48 +303,48 @@ class SynthCardDataset(Dataset):
 
     def __getitem__(self, item):
         
-        # if self.cache is not None:
-        #     sample = self.cache.get_slot(item)
-        #     if sample is None:
-        #         sample = self.get_sample(item)
-        #         self.cache.set_slot(item, sample, allow_overwrite=False)
-        # else:
-        sample = self.get_sample(item)
-
-        # add batch dimension
-        image, labelmap = sample[0], sample[1]#torch.chunk(sample, chunks=2, dim=0)
+        if self.cache is not None:
+            image = self.image_cache.get_slot(item)
+            labelmap = self.label_cache.get_slot(item)
+            if image is None:
+                image, labelmap = self.get_sample(item)
+                labelmap.squeeze_(1)
+                self.image_cache.set_slot(item, image, allow_overwrite=False)
+                self.label_cache.set_slot(item, labelmap, allow_overwrite=False)
+        else:
+            image, labelmap, ground_truth = self.get_sample(item)
 
         # apply data augmentation
         if self.do_augment:
             #image = self.photometric_augment(image.type(torch.ByteTensor)).type(torch.FloatTensor)
             #image = self.geometric_augment(image.type(torch.ByteTensor)).type(torch.FloatTensor)
             # Stack the image and mask together so they get the same geometric transformations
-            labelmap = torch.stack(labelmap, dim=0).squeeze(1)
-
-            image.unsqueeze(0)
  
-            stacked = torch.cat([image, labelmap], dim=0)  # shape=(6xHxW)
+            stacked = torch.cat([image.unsqueeze(0), labelmap, ground_truth.unsqueeze(0)], dim=0)  # shape=(6xHxW)
             stacked = self.geometric_augment(stacked)
 
             # Split them back up again and convert labelmap back to datatype long
-            image = stacked[0, ...].unsqueeze(0)
-            labelmap = stacked[1:, ...]
+            image = stacked[0, ...]
+            labelmap = stacked[1:6, ...]
+            ground_truth = stacked[6, ...].type(torch.LongTensor)
             labelmap = labelmap.type(torch.LongTensor)
-
-            # convert labelmap back to list
-            #labelmap = [labelmap[i, ...].unsqueeze(0) for i in range(labelmap.shape[0])]
-        else:
-            labelmap = torch.stack(labelmap, dim=0).squeeze(1)
 
         # normalize image intensities to [0,1]
         image /= 255
 
-        return {'image': image, 'labelmap': labelmap}
+        labelmap = labelmap.squeeze(1).long()
+
+        return {'image': image, 'labelmap': labelmap, 'ground_truth': ground_truth}
 
     def get_sample(self, item):
         sample = self.data[item]
         # read image and labelmap from disk
         image = read_image(sample[0]).type(torch.float32)
+        ground_truth = read_image(sample[2]).type(torch.uint8)
+        ground_truth[ground_truth==63] = 1 # heart
+        ground_truth[ground_truth==127] = 2
+        ground_truth[ground_truth==255] = 3
+        ground_truth[ground_truth==0] = 0
         maps = []
         for seg in sample[1]:
             labelmap = read_image(seg).type(torch.uint8).long()
@@ -349,15 +356,16 @@ class SynthCardDataset(Dataset):
             labelmap[labelmap==0] = 0 # background
             maps.append(labelmap)
 
-        if torch.rand(1) > self.rate_maps:  # randomly remove labelmaps
-            maps = [torch.zeros_like(maps[0]) for _ in range(len(maps))]
-
-        #stacked = torch.cat([image, labelmap], dim=0)  # shape=(2xHxW)
-        # print(image.shape, len(maps))
-        return image, maps
+        # stack labelmaps
+        labelmap = torch.stack(maps, dim=0) # shape (5, 128, 128)
+        # print labelmap type
+        labelmap = labelmap.to(torch.uint8)
+      
+        return image, labelmap, ground_truth
     
 class SynthCardDataModule(LightningDataModule):
-    def __init__(self, data_dir: str = '/vol/biomedic3/bglocker/cardiac_synth2d/', batch_size: int = 32, num_workers: int = 6, cache: bool = False, rate_maps: float = 1.0):
+    def __init__(self, data_dir: str = '/vol/biomedic3/bglocker/cardiac_synth2d/', batch_size: int = 32, num_workers: int = 10, cache: bool = False, rate_maps: float = 1.0,
+        augmentation: bool = False, random_seed: int = 42):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
@@ -368,25 +376,29 @@ class SynthCardDataModule(LightningDataModule):
         #     download_JRST(data_dir)
 
         files = os.listdir(data_dir + '/avg_img/')
+        reference_segs = os.listdir(data_dir + '/ref_seg/')
         seg_maps = os.listdir(data_dir + '/seg/')
 
         ims = [os.path.join(data_dir + '/avg_img/', file) for file in files]
+        ref_segs = [os.path.join(data_dir + '/ref_seg/', file) for file in reference_segs]
         segs = [os.path.join(data_dir + '/seg/', file) for file in seg_maps]
 
         # order lists
         ims.sort()
+        ref_segs.sort()
         segs.sort()
         # group segs into chunks of 5
         segs = [segs[i:i+5] for i in range(0, len(segs), 5)]
         
         ims = [d for d in ims if 'desktop.ini' not in d]
-        self.data = list(zip(ims, segs))
+        ref_segs = [d for d in ref_segs if 'desktop.ini' not in d]
+        self.data = list(zip(ims, segs, ref_segs))
         # remove 'desktop.ini' file
         #self.data = [d for d in self.data if 'desktop.ini' not in d[0]]
-        dev, self.test_data = train_test_split(self.data, test_size=0.2)
-        self.train_data, self.val_data = train_test_split(dev, test_size=0.05)
+        dev, self.test_data = train_test_split(self.data, test_size=0.2, random_state=random_seed)
+        self.train_data, self.val_data = train_test_split(dev, test_size=0.05, random_state=random_seed)
 
-        self.train_set = SynthCardDataset(self.train_data, self.data_dir, augmentation=True, cache=cache, rate_maps=rate_maps)
+        self.train_set = SynthCardDataset(self.train_data, self.data_dir, augmentation=augmentation, cache=cache, rate_maps=rate_maps)
         self.val_set = SynthCardDataset(self.val_data, self.data_dir, augmentation=False, cache=cache, rate_maps = 1.0)
         self.test_set = SynthCardDataset(self.test_data, self.data_dir, augmentation=False, cache=cache, rate_maps = 1.0)
 
@@ -628,7 +640,6 @@ class CURVASDataset(Dataset):
                 size_limit_gib=90,
                 dataset_len=len(self.data)*1030, # roughly 1030 slices per image
                 data_dims=[4, 512, 512],
-                # set dtype to tuple?
                 dtype=torch.float32,
             )
         else:
@@ -643,8 +654,8 @@ class CURVASDataset(Dataset):
         self.geometric_augment = transforms.Compose([
             transforms.RandomHorizontalFlip(p=0.25),
             transforms.RandomVerticalFlip(p=0.25),
-            transforms.RandomRotation(degrees=15),
-            transforms.RandomResizedCrop(size=(512, 512), scale=(0.8, 1.0), ratio=(0.75, 1.3333333333333333), interpolation=2),
+            transforms.RandomRotation(degrees=30),
+            transforms.RandomResizedCrop(size=(512, 512), scale=(0.5, 1.0), ratio=(0.5, 1.3333333333333333), interpolation=2),
         ])
 
         # collect samples (file paths) from dataset
@@ -652,20 +663,26 @@ class CURVASDataset(Dataset):
         self.slices = []
         self.num_slices = 0
         for idx, _ in enumerate(tqdm(range(len(data)), desc='Loading Data')):
-   
+            # if idx > 0:
+            #     break
             sample = {'image_path': data[idx]}
             self.samples.append(sample)
 
             # get 3D image
             image, maps = self.get_sample(sample)
+
+            # image = image[:, :, :32]
             
             if self.cache is not None:
                 for i in range(image.shape[-1]):
-                    mem = torch.stack([image[:, :, i], maps[0][:, :, i], maps[1][:, :, i], maps[2][:, :, i]], dim=0)
+                    image_slice = image[:, :, i]
+                    mem = torch.stack([image_slice, maps[0][:, :, i], maps[1][:, :, i], maps[2][:, :, i]], dim=0)
                     self.cache.set_slot(self.num_slices + i, mem, allow_overwrite=False)
             else:
                 for i in range(image.shape[-1]):
-                    self.slices.append((image[:, :, i], [maps[0][:, :, i], maps[1][:, :, i], maps[2][:, :, i]]))
+                    image_slice = image[:, :, i]
+                    #image_slice = F.adjust_contrast(image_slice.unsqueeze(0), 1.0).squeeze(0)
+                    self.slices.append((image_slice, [maps[0][:, :, i], maps[1][:, :, i], maps[2][:, :, i]]))
 
             self.num_slices += image.shape[-1]
 
@@ -680,6 +697,7 @@ class CURVASDataset(Dataset):
             maps = torch.stack([annotation1, annotation2, annotation3], dim=0)
             if image is None:
                 image, maps = torch.split(self.get_sample(item), [1, 3], dim=0)
+                
                 for i in range(len(image)):
                     mem = torch.stack([image[:, :, i], maps[0][:, :, i], maps[1][:, :, i], maps[2][:, :, i]], dim=0)
                     self.cache.set_slot(i*item + 1, mem, allow_overwrite=False)
@@ -688,15 +706,12 @@ class CURVASDataset(Dataset):
             maps = torch.stack(maps, dim=0)
 
         #print(image.shape, maps.shape)      # (512, 512) (3, 512, 512)
-
-        # adjust contrast
-        image = F.adjust_contrast(image.unsqueeze(0), 1.02).squeeze(0)
+        
         # apply data augmentation
         if self.do_augment:
             #image = self.photometric_augment(image.type(torch.ByteTensor)).type(torch.FloatTensor)
 
             # Stack the image and mask together so they get the same geometric transformations
-            
             stacked = torch.cat([image.unsqueeze(0), maps], dim=0)  # shape (4, 512, 512)
             stacked = self.geometric_augment(stacked)
 
@@ -708,7 +723,6 @@ class CURVASDataset(Dataset):
 
         labelmap = torch.cat([annotation1, annotation2, annotation3], dim=0).long()
 
-        #image = image#.unsqueeze(0)
         labelmap = labelmap.squeeze(1)
 
         return {'image': image, 'labelmap': labelmap}
@@ -719,6 +733,11 @@ class CURVASDataset(Dataset):
         # read image and labelmap from disk
         image = nib.load(sample['image_path'] + '/image.nii.gz').get_fdata()
         image = torch.from_numpy(image).float()     # shape (512, 512, 1010-ish)
+
+        # clipimage intensities to be between -1000 and 500
+        image = torch.clamp(image, -1000, 500)
+        # normalize image intensities to [-1, 1]
+        image = (image - (-1000)) / (500 - (-1000))
 
         annotation1 = nib.load(sample['image_path'] + '/annotation_1.nii.gz').get_fdata()
         annotation2 = nib.load(sample['image_path'] + '/annotation_2.nii.gz').get_fdata()
@@ -732,7 +751,8 @@ class CURVASDataset(Dataset):
         return image, maps
     
 class CURVASDataModule(LightningDataModule):
-    def __init__(self, data_dir: str = '/vol/bitbucket/bc1623/project/semi_supervised_uncertainty/data/CURVAS/training_set/', batch_size: int = 32, num_workers: int = 6, cache: bool = False):
+    def __init__(self, data_dir: str = '/vol/bitbucket/bc1623/project/semi_supervised_uncertainty/data/CURVAS/training_set/', batch_size: int = 32, num_workers: int = 12, cache: bool = False,
+        augmentation: bool = False, random_seed: int = 42):
         super().__init__()
         self.data_dir = data_dir
         self.batch_size = batch_size
@@ -740,10 +760,10 @@ class CURVASDataModule(LightningDataModule):
 
         files = os.listdir(data_dir)   
         self.data = [os.path.join(data_dir, file) for file in files]
-        dev, self.test_data = train_test_split(self.data, test_size=0.05)
-        self.train_data, self.val_data = train_test_split(dev, test_size=0.15)
+        dev, self.test_data = train_test_split(self.data, test_size=0.01, shuffle=True, random_state=random_seed)
+        self.train_data, self.val_data = train_test_split(dev, test_size=0.15, shuffle=True, random_state=random_seed)
 
-        self.train_set = CURVASDataset(self.train_data, self.data_dir, augmentation=True, cache=cache)
+        self.train_set = CURVASDataset(self.train_data, self.data_dir, augmentation=augmentation, cache=cache)
         self.val_set = CURVASDataset(self.val_data, self.data_dir, augmentation=False, cache=cache)
         self.test_set = CURVASDataset(self.test_data, self.data_dir, augmentation=False, cache=cache)
 
