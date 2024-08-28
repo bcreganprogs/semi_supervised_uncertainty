@@ -9,3 +9,6 @@
 /utils/__pycache__
 /runs
 /models/mae/__pycache__
+/hub
+/utils_local/__pycache__
+/dino_attention_maps

@@ -2,9 +2,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 
-from utils.utils import SoftPositionEmbed
+from utils_local.utils import SoftPositionEmbed
 
-from torchvision.models import resnet50, ResNet50_Weights, resnet34, ResNet34_Weights
+from torchvision.models import resnet50, ResNet50_Weights, resnet34, ResNet34_Weights, resnet18, ResNet18_Weights
+
     
 
 class ConvBlock(nn.Module):
@@ -78,26 +79,19 @@ class CNNEncoder(nn.Module):
 
         return x
     
-def get_resnet34_encoder():
-    model = resnet34(weights=None)#ResNet34_Weights.DEFAULT)
+def get_resnet34_encoder(pretrained=True):
+    if pretrained:
+        model = resnet34(weights=ResNet34_Weights.DEFAULT)
+    else:
+        model = resnet34(weights=None)
 
-    # Save the original weights and bias
-    original_conv = model.conv1
-    original_weight = original_conv.weight.clone()
-    original_bias = original_conv.bias.clone() if original_conv.bias is not None else None
+    return model
 
-    # Create a new convolutional layer with 1 input channel
-    new_conv = nn.Conv2d(1, 64, kernel_size=7, stride=2, padding=3, bias=False)
-
-    # Initialize the new layer with the average of the original weights across the channel dimension
-    new_conv.weight.data = original_weight.sum(dim=1, keepdim=True)
-
-    # If there was a bias, keep it
-    if original_bias is not None:
-        new_conv.bias = nn.Parameter(original_bias)
-
-    # Replace the first layer
-    model.conv1 = new_conv
+def get_resnet18_encoder(pretrained=True):
+    if not pretrained:
+        model = resnet18(weights=None)
+    else:
+        model = resnet18(weights=ResNet18_Weights.DEFAULT)
 
     return model
 
@@ -114,16 +108,149 @@ class ResNet34_8x8(nn.Module):
             base_model.relu,
             base_model.maxpool,
             base_model.layer1,
+            base_model.layer2,
+            
 
         )
         self.features_2 = nn.Sequential(
-            base_model.layer2,
             base_model.layer3,
             base_model.layer4,
         )
     
     def forward(self, x):
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
         x1 = self.features_1(x) # shape (batch_size, 64, 32, 32)
         x2 = self.features_2(x1) # shape (batch_size, 256, 8, 8)
       
-        return x2, x1
+        return x1
+
+class ResNet18(nn.Module):
+    def __init__(self, base_model):
+        super(ResNet18, self).__init__()
+        self.features = nn.Sequential(
+            *list(base_model.children())[:7]
+        )
+
+        self.features_1 = nn.Sequential(
+            base_model.conv1,
+            base_model.bn1,
+            base_model.relu,
+            base_model.maxpool,
+            base_model.layer1,
+            base_model.layer2,
+            base_model.layer3,
+
+        )
+        self.features_2 = nn.Sequential(
+            
+            base_model.layer4,
+        )
+    
+    def forward(self, x):
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+        x1 = self.features_1(x) # shape (batch_size, 64, 32, 32)
+        # x2 = self.features_2(x1) # shape (batch_size, 256, 8, 8)
+      
+        return x1
+    
+class DinoViT_16(nn.Module):
+    def __init__(self, num_channels=1):
+        super(DinoViT_16, self).__init__()
+        
+        self.model = torch.hub.load('facebookresearch/dino:main', 'dino_vits16')
+
+
+    def forward(self, x):
+        
+        # if x only has one channel, expand it to 3 channels
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+
+        x = self.model.prepare_tokens(x)
+
+        for blk in self.model.blocks:
+            x = blk(x)
+
+        x = x[:, 1:] # remove the cls token
+
+        return x
+    
+class DinoViTB_16(nn.Module):
+    def __init__(self, num_channels=1):
+        super(DinoViTB_16, self).__init__()
+        
+        self.model = torch.hub.load('facebookresearch/dino:main', 'dino_vitb16')
+
+    def forward(self, x):
+        
+        # if x only has one channel, expand it to 3 channels
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+
+        x = self.model.prepare_tokens(x)
+
+        for blk in self.model.blocks:
+            x = blk(x)
+
+        x = x[:, 1:] # remove the cls token
+
+        return x
+
+class Dinov2ViT_14(nn.Module):
+    def __init__(self, num_channels=1):
+        super(Dinov2ViT_14, self).__init__()
+        
+        self.model = torch.hub.load('facebookresearch/dinov2', 'dinov2_vits14')
+
+    def forward(self, x):
+        
+        # if x only has one channel, expand it to 3 channels
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)      
+        x = self.get_patch_embeddings(x)[0]
+        x = x[:, 1:, :] # remove the cls token
+
+        return x
+    
+    def get_patch_embeddings(self, x):
+        intermediate_outputs = []
+        hooks = []
+    
+        def hook(module, input, output):
+            intermediate_outputs.append(output)
+        
+        for block in self.model.blocks[-1:]:
+            handle = block.register_forward_hook(hook)
+            hooks.append(handle)
+        
+        _ = self.model(x)
+
+        # remove the hooks
+        for h in hooks:
+            h.remove()
+        
+        return intermediate_outputs
+    
+class DinoViT_8(nn.Module):
+    def __init__(self, num_channels=1):
+        super(DinoViT_8, self).__init__()
+        
+        self.model = torch.hub.load('facebookresearch/dino:main', 'dino_vits8')
+
+
+    def forward(self, x):
+        
+        # if x only has one channel, expand it to 3 channels
+        if x.shape[1] == 1:
+            x = x.repeat(1, 3, 1, 1)
+
+        x = self.model.prepare_tokens(x)
+
+        for blk in self.model.blocks:
+            x = blk(x)
+
+        x = x[:, 1:] # remove the cls token
+
+        return x

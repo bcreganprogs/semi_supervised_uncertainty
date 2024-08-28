@@ -522,7 +522,7 @@ class FixedSlotAttentionMultiHeadProb(torch.nn.Module):
         # learnable weights
         self.mixing_coeffs = nn.Parameter(1/self.num_slots * torch.ones(1, self.num_slots), requires_grad=False)  # shape (1, K)
         self.to_keys = nn.Parameter(torch.rand(self.input_dim, self.slot_dim))      # from inputs
-        self.to_queries = nn.Parameter(torch.rand(self.slot_dim, self.slot_dim))   # from slots
+        self.to_queries = nn.Parameter(torch.rand(self.num_slots, self.slot_dim, self.slot_dim))   # from slots
         self.to_values = nn.Parameter(torch.rand(self.input_dim, self.slot_dim))    # from inputs
 
         self.gru = nn.GRUCell(slot_dim, slot_dim)
@@ -562,13 +562,13 @@ class FixedSlotAttentionMultiHeadProb(torch.nn.Module):
    
         for _ in range(self.num_iterations):
             slots_prev = slots
-            slots = self.layer_norm_slots(slots) # shape (B, K, D)
             slots = slots.detach()
+            slots = self.layer_norm_slots(slots) # shape (B, K, D)
 
             # attention = mixture coefficients * likelihood of gaussian / sum of mixture coefficients * likelihood of gaussian
             # Bishop Pattern Recognition and Machine Learning page 78
             # find likelihood of keys under normal given by queries and sigma
-            queries = torch.einsum('bkd,dd->bkd', slots, self.to_queries).view(B, self.num_slots, self.num_heads, self.slot_dim // self.num_heads).unsqueeze(2)  # shape (B, K, H, 1, D/H)
+            queries = torch.einsum('bkd,kdd->bkd', slots, self.to_queries).view(B, self.num_slots, self.num_heads, self.slot_dim // self.num_heads).unsqueeze(2)  # shape (B, K, H, 1, D/H)
             sigma = sigma.view(B, self.num_slots, self.num_heads, self.slot_dim // self.num_heads).unsqueeze(2) # shape (B, K, H, 1, D/H)
 
     	    # sigma shape B, K, D, query shape B, K, H, D/H, keys shape B, K, N, H, D/H

@@ -72,8 +72,8 @@ model2 = ViTAE(
     learning_rate=1e-4,
 )
 
-oss = DINOSAUR(saved_model, model2, num_slots=6, num_iterations=3, num_classes=4, slot_dim=256, task='recon',
-                                 learning_rate=4e-4, temperature=1, log_images=True, lr_warmup=True,
+oss = DINOSAUR(saved_model, model2, num_slots=6, num_iterations=3, num_classes=4, slot_dim=768, task='recon',
+                    learning_rate=4e-4, temperature=1, log_images=True, lr_warmup=True, dec_type='mlp',
                                  probabilistic_slots=False)
 
 #data = JSRTDataModule(data_dir='/vol/bitbucket/bc1623/project/semi_supervised_uncertainty/data/JSRT/', batch_size=64, augmentation=True)
@@ -82,7 +82,7 @@ data = CheXpertDataModule(data_dir='/vol/biodata/data/chest_xray/CheXpert-v1.0/p
 #data = SynthCardDataModule(batch_size=128, rate_maps=0.2)
 
 wandb_logger = WandbLogger(save_dir='./runs/lightning_logs/dinosaur_recons/', project='dinosaur_recons',
-                           name='chexpert_recon_mlp_decoder', id='chexpert_recon_mlp_decoder_3')
+                           name='chexpert_recon_mlp_decoder_test_3', id='chexpert_recon_mlp_decoder_test_3', offline=False, log_model=True)
 output_dir = Path(f"dinosaur_recons/run_{wandb_logger.experiment.id}")  # type: ignore
 print("Saving to" + str(output_dir.absolute()))
 
@@ -90,7 +90,7 @@ trainer = Trainer(
     max_steps=250000,
     precision='16-mixed',
     accelerator='auto',
-    devices=[0],
+    devices=[1],
     strategy='ddp_find_unused_parameters_true',
     # log_every_n_steps=250,
     val_check_interval=0.5,

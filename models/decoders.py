@@ -137,7 +137,7 @@ class Upsample(nn.Module):
         # else:
         #     self.upsample = nn.Upsample(scale_factor=2, mode='bilinear', align_corners=False)
         self.upsample = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, out_channels, kernel_size=4, stride=2, padding=1),
+            nn.ConvTranspose2d(in_channels, in_channels, kernel_size=4, stride=2, padding=1),
             # nn.BatchNorm2d(in_channels),
             # nn.ReLU(inplace=True),
         )

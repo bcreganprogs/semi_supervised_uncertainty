@@ -9,12 +9,13 @@ from pytorch_lightning import LightningModule
 import wandb
 
 from utils.utils import SoftPositionEmbed, spatial_broadcast, unstack_and_split
-from models.slot_attention import ProbabalisticSlotAttention, FixedSlotAttention, SlotAttention
+from models.slot_attention import ProbabalisticSlotAttention, FixedSlotAttention, SlotAttention, FixedSlotAttentionMultiHead
 from models.decoders import SlotSpecificDecoder, Decoder, MlpDecoder
+from models.transformers import TransformerDecoder
 
 class DINOSAUR(LightningModule):
     def __init__(self, frozen_encoder, trainable_encoder, num_slots, num_iterations, num_classes, slot_dim=128, task='recon', include_seg_loss=False, probabilistic_slots=True, 
-                dec_type='mlp', learning_rate=1e-3, hidden_decoder_dim=2048, temperature=1, lr_warmup=True, log_images=True):
+                dec_type='mlp', learning_rate=1e-3, hidden_decoder_dim=2048, temperature=1, lr_warmup=True, log_images=True, embedding_dim=768, num_patches=196):
         super(DINOSAUR, self).__init__()
 
         self.frozen_encoder = frozen_encoder.model
@@ -25,20 +26,26 @@ class DINOSAUR(LightningModule):
             self.slot_attention = ProbabalisticSlotAttention(num_slots=num_slots, dim=slot_dim, num_iterations=num_iterations, temperature=temperature)
         else:
             #self.slot_attention = SlotAttention(num_slots, slot_dim, num_iterations, temperature=temperature)
-            self.slot_attention = FixedSlotAttentionMultiHeadProb(num_slots=num_slots, dim=slot_dim, num_iterations=num_iterations, temperature=temperature)
+            self.slot_attention = FixedSlotAttentionMultiHead(num_slots=num_slots, dim=slot_dim, num_iterations=num_iterations, temperature=temperature)
             #FixedSlotAttention(num_slots=num_slots, dim=slot_dim, num_iterations=num_iterations, temperature=temperature)
         
         if self.dec_type=='transformer':
-            self.dec = TransformerDecoder(
-                args.num_dec_blocks, args.max_tokens, args.d_model, args.num_heads, args.dropout, args.num_cross_heads)
-            if self.cappa > 0:
-                assert (self.train_permutations == 'standard') and (self.eval_permutations == 'standard')   
-                self.mask_token = nn.Parameter(torch.zeros(1, 1, args.d_model))
-                self.pos_embed = nn.Parameter(torch.zeros(1, num_tokens, args.d_model))
-                torch.nn.init.normal_(self.pos_embed, std=.02)
-                torch.nn.init.normal_(self.mask_token, std=.02)
+            self.decoder = TransformerDecoder(
+                4, num_patches, embedding_dim, 4, 0.0, 4)
+            self.mask_token = nn.Parameter(torch.zeros(1, 1, embedding_dim))
+            self.pos_embed = nn.Parameter(torch.zeros(1, num_patches, embedding_dim))
+            torch.nn.init.normal_(self.pos_embed, std=.02)
+            torch.nn.init.normal_(self.mask_token, std=.02)
+            self.input_proj = nn.Sequential(
+                nn.Linear(embedding_dim, embedding_dim, bias=False),
+                nn.LayerNorm(embedding_dim),
+            )
+            self.slot_proj = nn.Sequential(
+                nn.Linear(slot_dim, slot_dim, bias=False),
+                nn.LayerNorm(slot_dim),
+            )
         elif self.dec_type=='mlp':
-            self.mlp_decoder = MlpDecoder(slot_dim, 768, 14*14, hidden_features=hidden_decoder_dim)
+            self.decoder = MlpDecoder(slot_dim, 768, 14*14, hidden_features=hidden_decoder_dim)
 
         self.mlp = nn.Sequential(
             nn.Linear(768, slot_dim),
@@ -48,6 +55,7 @@ class DINOSAUR(LightningModule):
 
         self.decoder_pos_embeddings = SoftPositionEmbed(slot_dim, (14, 14))
         self.num_classes = num_classes
+        self.num_slots = num_slots
         self.task = task
         self.learning_rate = learning_rate
         self.lr_warmup = lr_warmup
@@ -64,7 +72,7 @@ class DINOSAUR(LightningModule):
         for param in self.frozen_encoder.parameters():
             param.requires_grad = False
   
-        self.mlp_decoder.apply(self.init_weights)
+        self.decoder.apply(self.init_weights)
         self.mlp.apply(self.init_weights)
         self.slot_attention.apply(self.init_weights)
 
@@ -83,11 +91,20 @@ class DINOSAUR(LightningModule):
         self.logged_train_images_this_epoch = False
         self.logged_val_images_this_epoch = False
 
+        if self.dec_type=='transformer':
+            # Register hook for capturing the cross-attention (of the query patch
+            # tokens over the key/value slot tokens) from the last decoder
+            # transformer block of the decoder.
+            self.dec_slots_attns = []
+            def hook_fn_forward_attn(module, input):
+                self.dec_slots_attns.append(input[0])
+            self.remove_handle = self.decoder._modules["blocks"][-1]._modules["encoder_decoder_attn"]._modules["attn_dropout"].register_forward_pre_hook(hook_fn_forward_attn)
+
     def forward(self, x):
         batch_size = x.size(0)
         with torch.no_grad():
-            patch_embeddings_frozen, _, _ = self.frozen_encoder.forward_encoder(x, 0.0)
-            patch_embeddings_frozen = patch_embeddings_frozen[:, 1:, :]     # exclude cls token
+            patch_embeddings_targets, _, _ = self.frozen_encoder.forward_encoder(x, 0.0)
+            patch_embeddings_targets = patch_embeddings_targets[:, 1:, :]     # exclude cls token
 
         # generate patch features from trainable encoder
         patch_embeddings_train, _, _ = self.trainable_encoder.forward_encoder(x, 0.0)
@@ -100,15 +117,41 @@ class DINOSAUR(LightningModule):
         # apply slot attention to trainable patch features
         slots, slot_attn = self.slot_attention(patch_embeddings_train)            # slots: shape (batch_size, num_slots, slot_dim)
 
-        x = self.embedding_norm_decoder(slots)
-        recons, masks = self.mlp_decoder(x)                                       # shape (batch_size, num_classes, H, W, slot_dim + 1)
+        slots = self.embedding_norm_decoder(slots)
+
+        slots = self.slot_proj(slots)
+        
+        if self.dec_type=='transformer':
+            # parallel decoder
+            dec_input = self.mask_token.to(patch_embeddings_targets.dtype).expand(batch_size, -1, -1)
+            dec_input = self.input_proj(dec_input)
+            # add position embeddings
+            dec_input = dec_input + self.pos_embed.to(patch_embeddings_targets.dtype)
+
+            recons = self.decoder(dec_input, slots)                                               # shape (batch_size, num_classes, H, W, slot_dim + 1)
+            #print('recons shape:', recons.shape)
+            dec_slots_attns = self.dec_slots_attns[0]
+            self.dec_slots_attns = []
+
+            # sum over heads 
+            dec_slots_attns = dec_slots_attns.mean(dim=1)       # (batch_size, num_heads, num_patches, num_slots)
+            # normalise 
+            dec_slots_attns = dec_slots_attns / dec_slots_attns.sum(dim=2, keepdim=True)
+
+            masks = dec_slots_attns # (batch_size, 1, num_slots)
+     
+            masks = masks.transpose(-1, -2).reshape(batch_size, self.num_slots, 14, 14)
+
+        elif self.dec_type=='mlp':
+            recons, masks = self.decoder(slots)                           # masks shape (batch_size, num_slots, num_patches)
+            masks = masks.transpose(1, 2).reshape(batch_size, self.num_slots, 14, 14)
 
         # log masks
         self.masks = masks[0, ...]
 
         preds = torch.argmax(masks, dim=1)
 
-        return patch_embeddings_frozen, recons, masks, preds, slot_attn
+        return patch_embeddings_targets, recons, masks, preds, slot_attn
     
     def init_weights(self, m):
         if isinstance(m, nn.Conv2d) or isinstance(m, nn.Linear):
@@ -149,6 +192,7 @@ class DINOSAUR(LightningModule):
         except:
             y = None
      
+        batch_size, num_chans, H, W = x.size()
         # generate patch features from frozen encoder
         targets, recons, masks, preds, attn = self(x)
 
@@ -158,7 +202,9 @@ class DINOSAUR(LightningModule):
         self.preds = preds[0, ...]
 
         # calculate loss
-        loss = torch.cdist(targets, recons, p=2).mean()
+        #loss = torch.cdist(targets, recons, p=2).mean()
+        num_patches = attn.shape[1]
+        loss = ((targets - recons)**2).sum() / (batch_size * num_patches * 768)
         if self.include_seg_loss and y is not None:
             seg_loss = F.cross_entropy(masks, y.squeeze(), ignore_index=0)
             loss += seg_loss
@@ -201,9 +247,9 @@ class DINOSAUR(LightningModule):
 
     def on_train_epoch_end(self):
         if self.log_images:
-            if not self.logged_train_images_this_epoch and self.train_imgs is not None:
-                self._log_train_images(self.train_imgs, self.train_preds)
-                self.logged_train_images_this_epoch = True
+            # if not self.logged_train_images_this_epoch and self.train_imgs is not None:
+            #     self._log_train_images(self.train_imgs, self.train_preds)
+            #     self.logged_train_images_this_epoch = True
             
             self.train_imgs = None
             self.train_preds = None
@@ -216,9 +262,9 @@ class DINOSAUR(LightningModule):
 
     def on_validation_epoch_end(self):
         if self.log_images:
-            if not self.logged_val_images_this_epoch and self.val_imgs is not None:
-                self._log_val_images(self.val_imgs, self.val_preds)
-                self.logged_val_images_this_epoch = True
+            # if not self.logged_val_images_this_epoch and self.val_imgs is not None:
+            #     self._log_val_images(self.val_imgs, self.val_preds)
+            #     self.logged_val_images_this_epoch = True
             
             self.val_imgs = None
             self.val_preds = None
@@ -251,8 +297,10 @@ class DINOSAUR(LightningModule):
 
     def _log_key_images(self):
         attn, masks = self.attn, self.masks
-        attn_maps = make_grid(attn.reshape(-1, 14, 14)).unsqueeze(1)
-        masks = make_grid(masks.reshape(-1, 14, 14)).unsqueeze(1)
+        num_slots = attn.shape[0]
+        resn = attn.shape[1]
+        attn_maps = make_grid(attn.reshape(1, num_slots, int(resn**0.5), int(resn**0.5))).unsqueeze(1)
+        masks = make_grid(masks).unsqueeze(1)
       
         self.logger.experiment.log({
             "Slot Attention Maps": [

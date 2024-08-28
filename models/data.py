@@ -44,8 +44,8 @@ class JSRTDataset(Dataset):
                 transforms.RandomResizedCrop(224, scale=(0.7, 1.0), ratio=(0.75, 1.1), interpolation=transforms.InterpolationMode.NEAREST)
             ], p=0.2),
             transforms.RandomRotation(20, interpolation=transforms.InterpolationMode.NEAREST),
-            transforms.RandomHorizontalFlip(p=0.2),
-            transforms.RandomVerticalFlip(p=0.2),
+            # transforms.RandomHorizontalFlip(p=0.2),
+            # transforms.RandomVerticalFlip(p=0.2),
             # transforms.RandomApply(transforms=[
             #     transforms.GaussianBlur(kernel_size=3, sigma=(0.1, 2.0)),
             # ], p=0.2),
@@ -286,7 +286,7 @@ class SynthCardDataset(Dataset):
             transforms.RandomApply(transforms=[transforms.RandomAffine(degrees=5, scale=(0.9, 1.0), interpolation=transforms.InterpolationMode.NEAREST)], 
                                                 p = 0.5),
             #transforms.RandomRotation(15),
-            transforms.RandomApply(transforms=[transforms.RandomResizedCrop(128, scale=(0.8, 1.0), ratio=(0.75, 1.0))] , p=0.3),
+            transforms.RandomApply(transforms=[transforms.RandomResizedCrop(128, scale=(0.5, 1.0), ratio=(0.5, 1.0))] , p=0.5),
             transforms.RandomHorizontalFlip(p=0.3), 
             transforms.RandomVerticalFlip(p=0.3),
         ])
@@ -663,7 +663,7 @@ class CURVASDataset(Dataset):
         self.slices = []
         self.num_slices = 0
         for idx, _ in enumerate(tqdm(range(len(data)), desc='Loading Data')):
-            # if idx > 0:
+            # if idx > 2:
             #     break
             sample = {'image_path': data[idx]}
             self.samples.append(sample)
@@ -771,7 +771,7 @@ class CURVASDataModule(LightningDataModule):
         return DataLoader(dataset=self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
     def val_dataloader(self):
-        return DataLoader(dataset=self.val_set, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        return DataLoader(dataset=self.val_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
     def test_dataloader(self):
         return DataLoader(dataset=self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)

@@ -63,9 +63,9 @@ model = ViTAE(
 #     learning_rate=1e-4,
 # )
 
-# saved_model = ViTAE.load_from_checkpoint('/vol/bitbucket/bc1623/project/semi_supervised_uncertainty/bash_scripts/lightning_logs/chestxray_mae/chestxray_mae/gn9nzdz8/checkpoints/epoch=503-step=95256.ckpt',
+# saved_model = ViTAE.load_from_checkpoint('/vol/bitbucket/bc1623/project/semi_supervised_uncertainty/bash_scripts/lightning_logs/abdomin_mae/abdomin_mae/abdomin_mae_4/checkpoints/epoch=127-step=14592.ckpt',
 #      model_kwargs={
-#         'img_size': 224,
+#         'img_size': 512,
 #         'embed_dim': 768,
 #         'in_chans': 1,
 #         'num_heads': 12,
@@ -85,7 +85,7 @@ model = ViTAE(
 torch.set_float32_matmul_precision("medium")
 
 wandb_logger = WandbLogger(save_dir='./lightning_logs/abdomin_mae/', project='abdomin_mae',
-                           name='abdomin_mae_4', id='abdomin_mae_4', offline=False)
+                           name='abdomin_mae_7', id='abdomin_mae_7', offline=False)
 output_dir = Path(f"abdomin_mae/run_{wandb_logger.experiment.id}")  # type: ignore
 print("Saving to" + str(output_dir.absolute()))
 

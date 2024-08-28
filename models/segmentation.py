@@ -349,7 +349,7 @@ class ObjectSpecificSegmentation(LightningModule):
         recon_loss = F.mse_loss(recons.squeeze(), x.squeeze()) 
 
         if self.include_seg_loss:
-            loss = 0.1 * recon_loss
+            loss = 0.0 * recon_loss
             # only consider masks and y for which y is not all zeros
             # indices = torch.where(y.squeeze().sum(dim=(1, 2)) > 0)[0]
             # loss_masks = masks[indices]
