@@ -283,10 +283,10 @@ class SynthCardDataset(Dataset):
 
         # geometric data augmentation
         self.geometric_augment = transforms.Compose([
-            transforms.RandomApply(transforms=[transforms.RandomAffine(degrees=5, scale=(0.9, 1.0), interpolation=transforms.InterpolationMode.NEAREST)], 
-                                                p = 0.5),
-            #transforms.RandomRotation(15),
-            transforms.RandomApply(transforms=[transforms.RandomResizedCrop(128, scale=(0.5, 1.0), ratio=(0.5, 1.0))] , p=0.5),
+            # transforms.RandomApply(transforms=[transforms.RandomAffine(degrees=5, scale=(0.9, 1.0), interpolation=transforms.InterpolationMode.NEAREST)], 
+            #                                     p = 0.5),
+            transforms.RandomRotation(30),
+            transforms.RandomApply(transforms=[transforms.RandomResizedCrop(128, scale=(0.7, 1.0), ratio=(0.7, 1.0))] , p=0.5),
             transforms.RandomHorizontalFlip(p=0.3), 
             transforms.RandomVerticalFlip(p=0.3),
         ])
@@ -637,8 +637,8 @@ class CURVASDataset(Dataset):
 
         if cache:
             self.cache = SharedCache(
-                size_limit_gib=90,
-                dataset_len=len(self.data)*1030, # roughly 1030 slices per image
+                size_limit_gib=100,
+                dataset_len=len(self.data)*1150, # roughly 1030 slices per image
                 data_dims=[4, 512, 512],
                 dtype=torch.float32,
             )
@@ -652,10 +652,10 @@ class CURVASDataset(Dataset):
 
         # geometric data augmentation
         self.geometric_augment = transforms.Compose([
-            transforms.RandomHorizontalFlip(p=0.25),
-            transforms.RandomVerticalFlip(p=0.25),
-            transforms.RandomRotation(degrees=30),
-            transforms.RandomResizedCrop(size=(512, 512), scale=(0.5, 1.0), ratio=(0.5, 1.3333333333333333), interpolation=2),
+            transforms.RandomHorizontalFlip(p=0.1),
+            transforms.RandomVerticalFlip(p=0.1),
+            transforms.RandomRotation(degrees=15),
+            transforms.RandomResizedCrop(size=(512, 512), scale=(0.8, 1.0), ratio=(0.8, 1.0), interpolation=2),
         ])
 
         # collect samples (file paths) from dataset
@@ -760,12 +760,12 @@ class CURVASDataModule(LightningDataModule):
 
         files = os.listdir(data_dir)   
         self.data = [os.path.join(data_dir, file) for file in files]
-        dev, self.test_data = train_test_split(self.data, test_size=0.01, shuffle=True, random_state=random_seed)
-        self.train_data, self.val_data = train_test_split(dev, test_size=0.15, shuffle=True, random_state=random_seed)
+        dev, self.test_data = train_test_split(self.data, test_size=0.1, shuffle=True, random_state=random_seed)
+        self.train_data, self.val_data = train_test_split(dev, test_size=0.1, shuffle=True, random_state=random_seed)
 
-        self.train_set = CURVASDataset(self.train_data, self.data_dir, augmentation=augmentation, cache=cache)
-        self.val_set = CURVASDataset(self.val_data, self.data_dir, augmentation=False, cache=cache)
-        self.test_set = CURVASDataset(self.test_data, self.data_dir, augmentation=False, cache=cache)
+        self.train_set = CURVASDataset(self.train_data[:1], self.data_dir, augmentation=augmentation, cache=cache)
+        self.val_set = CURVASDataset(self.val_data[:1], self.data_dir, augmentation=False, cache=cache)
+        self.test_set = CURVASDataset(self.test_data[:1], self.data_dir, augmentation=False, cache=cache)
 
     def train_dataloader(self):
         return DataLoader(dataset=self.train_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
@@ -774,7 +774,7 @@ class CURVASDataModule(LightningDataModule):
         return DataLoader(dataset=self.val_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
 
     def test_dataloader(self):
-        return DataLoader(dataset=self.test_set, batch_size=self.batch_size, shuffle=False, num_workers=self.num_workers)
+        return DataLoader(dataset=self.test_set, batch_size=self.batch_size, shuffle=True, num_workers=self.num_workers)
     
 
 def download_JRST(data_dir: str = './data/JSRT/'):

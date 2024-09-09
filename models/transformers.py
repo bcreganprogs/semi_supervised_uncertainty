@@ -3,6 +3,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from torchvision import transforms
 from torchvision.utils import draw_segmentation_masks
+from timm.models.vision_transformer import Block
 
 from models.utils_spot import *
 
@@ -107,16 +108,10 @@ class TransformerDecoderBlock(nn.Module):
 
         self_attn_mask = self.self_attn_mask[:T, :T] if causal_mask else None
         if self.is_first:
-            # input = self.encoder_decoder_attn_layer_norm(input)
-            # x = self.encoder_decoder_attn(input, encoder_output, encoder_output)
-            # input = input + x
             input = self.self_attn_layer_norm(input)
             x = self.self_attn(input, input, input, self_attn_mask)
             input = input + x     # combine with post layer norm
         else:
-            # x = self.encoder_decoder_attn_layer_norm(input)
-            # x = self.encoder_decoder_attn(x, encoder_output, encoder_output)
-            # input = input + x
             x = self.self_attn_layer_norm(input)
             x = self.self_attn(x, x, x, self_attn_mask)
             input = input + x         # combine with pre layer norm
@@ -124,10 +119,6 @@ class TransformerDecoderBlock(nn.Module):
         x = self.encoder_decoder_attn_layer_norm(input)
         x = self.encoder_decoder_attn(x, encoder_output, encoder_output)
         input = input + x
-
-        # x = self.self_attn_layer_norm(input)
-        # x = self.self_attn(input, input, input, self_attn_mask)
-        # input = input + x
         
         x = self.ffn_layer_norm(input)
         x = self.ffn(x)
@@ -182,23 +173,45 @@ class TransformerDecoderImage(nn.Module):
             self.blocks = nn.ModuleList(
                 [TransformerDecoderBlock(max_len, d_model, num_heads, dropout, gain, is_first=True)] +
                 [TransformerDecoderBlock(max_len, d_model, num_heads, dropout, gain, is_first=False, num_cross_heads=num_cross_heads)
-                 for _ in range(num_blocks - 1)])
-            self.recons_block = TransformerDecoderBlock(max_len, d_model, num_heads, dropout, gain, is_first=False, num_cross_heads=num_cross_heads)
-            self.masks_block = TransformerDecoderBlock(max_len, d_model, num_heads, dropout, gain, is_first=False, num_cross_heads=num_cross_heads)
+                 for _ in range(num_blocks - 1)])	
         else:
             self.blocks = nn.ModuleList()
 
         self.layer_norm_recons = nn.LayerNorm(d_model)
-        self.layer_norm_masks = nn.LayerNorm(d_model)
+
+        # self.layer_norm_decoder = nn.LayerNorm(d_model)
+
+        # self.decoder_pos_embed = PositionalEncoding(max_len, d_model, dropout)
+
+        # self.decoder_blocks = nn.ModuleList([
+        #     Block(d_model, num_heads, 4, qkv_bias=True, norm_layer=nn.LayerNorm)
+        #     for i in range(num_blocks)])
 
         if self.autoregressive:
-            self.recon_projs = nn.ModuleList([nn.Linear(d_model, patch_size**2, bias=True) for _ in range(out_chans)])
-            self.mask_projs = nn.ModuleList([nn.Linear(d_model, patch_size**2, bias=True) for _ in range(out_chans)])
+            self.recon_projs = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Linear(d_model, patch_size**2 * 4, bias=True),
+                        nn.LeakyReLU(),
+                        nn.Linear(patch_size**2 * 4, patch_size**2 * 4, bias=True),
+                        nn.LeakyReLU(),
+                        nn.Linear(patch_size**2 * 4, patch_size**2, bias=True)
+                    ) for _ in range(out_chans)
+                ])
+            self.mask_projs = nn.ModuleList([
+                    nn.Sequential(
+                        nn.Linear(d_model, patch_size**2 * 4, bias=True),
+                        nn.LeakyReLU(),
+                        nn.Linear(patch_size**2 * 4, patch_size**2 * 4, bias=True),
+                        nn.LeakyReLU(),
+                        nn.Linear(patch_size**2 * 4, patch_size**2, bias=True)
+                    ) for _ in range(out_chans)
+                ])
+            # self.recon_projs = nn.ModuleList([nn.Linear(d_model, patch_size**2, bias=True) for _ in range(out_chans)])
+            # self.mask_projs = nn.ModuleList([nn.Linear(d_model, patch_size**2, bias=True) for _ in range(out_chans)])
         else:
             self.recon_projs = nn.ModuleList([nn.Linear(d_model, patch_size**2, bias=True)])
             self.mask_projs = nn.ModuleList([nn.Linear(d_model, patch_size**2, bias=True)])
 
-        # self.end_projs.apply(self.init_weights)
         self.recon_projs.apply(self.init_weights)
         self.mask_projs.apply(self.init_weights)    
         
@@ -208,7 +221,7 @@ class TransformerDecoderImage(nn.Module):
             if m.bias is not None:
                 nn.init.zeros_(m.bias)  
 
-    def forward(self, input, encoder_output, causal_mask=False):
+    def forward(self, input, encoder_output, causal_mask=False, inv_perm_indices=None):
         """
         input: batch_size x target_len x d_model
         encoder_output: batch_size x source_len x d_model
@@ -219,6 +232,16 @@ class TransformerDecoderImage(nn.Module):
 
         input = self.layer_norm_recons(input)
 
+        # input = input + self.decoder_pos_embed(input)
+
+        # for blk in self.decoder_blocks:
+        #     input = blk(input)
+
+        # input = self.layer_norm_decoder(input)
+
+        if inv_perm_indices is not None:
+            input = input[:, inv_perm_indices, :]
+
         recons = []
         masks = []
     
@@ -227,16 +250,11 @@ class TransformerDecoderImage(nn.Module):
             recon = self.recon_projs[slot](input)
             mask = self.mask_projs[slot](input)
 
-            # mask1, mask2 = torch.split(mask, self.patch_size**2, dim=-1)
-            # # print(mask1.shape)  # shape (batch_size, num_patches, patch_size**2)
             recons.append(recon)
             masks.append(mask)
 
-
         recons = torch.stack(recons, dim=1)
         masks = torch.stack(masks, dim=1) # shape (batch _size, num_slots, num_patches, patch_size**2)
-
-        # print(masks.shape) # shape (batch_size, out_chans, num_patches, patch_size**2)
        
         return recons, masks
     

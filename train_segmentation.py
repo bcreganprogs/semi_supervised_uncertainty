@@ -37,6 +37,7 @@ parser.add_argument('--temperature', type=float, default=1, help='Temperature')
 parser.add_argument('--log_images', action=argparse.BooleanOptionalAction, help='Log images')
 parser.add_argument('--lr_warmup', action=argparse.BooleanOptionalAction, help='Learning rate warmup')
 parser.add_argument('--include_seg_loss', action=argparse.BooleanOptionalAction, help='Include segmentation loss')
+parser.add_argument('--calibration_loss', action=argparse.BooleanOptionalAction, help='Include calibration loss')
 parser.add_argument('--slot_attn_type', type=str, default='probabilistic', help='Slot attention type')
 parser.add_argument('--probabilistic_sample', action=argparse.BooleanOptionalAction, help='Sample from probabilistic slot attention')
 parser.add_argument('--image_chans', type=int, default=1, help='Number of image channels')
@@ -136,19 +137,11 @@ if args.load is None:
                                     embedding_dim=args.embedding_dim, embedding_shape=(args.embedding_shape, args.embedding_shape),
                                     include_pos_embed=args.include_pos_embed, patch_size=args.patch_size, num_patches=args.num_patches,
                                     slot_attn_heads=args.slot_attn_heads, decoder_blocks=args.decoder_blocks, decoder_heads=args.decoder_heads, 
-                                    decoder_dim=args.decoder_dim, autoregressive=args.autoregressive, label_smoothing=args.label_smoothing)
+                                    decoder_dim=args.decoder_dim, autoregressive=args.autoregressive, label_smoothing=args.label_smoothing,
+                                    calibration_loss=args.calibration_loss)
 else:
     model = ObjectSpecificSegmentation.load_from_checkpoint(args.load,
-                                    encoder=encoder, num_slots=args.num_slots, num_iterations=args.num_iterations, num_classes=args.num_classes, 
-                                    slot_dim=args.slot_dim, decoder_type=args.decoder_type, 
-                                    learning_rate=args.learning_rate, freeze_encoder=args.freeze_encoder, temperature=args.temperature, 
-                                    log_images=args.log_images, lr_warmup=args.lr_warmup, include_seg_loss=args.include_seg_loss,
-                                    slot_attn_type=args.slot_attn_type, probabilistic_sample=args.probabilistic_sample, image_chans=args.image_chans, 
-                                    image_resolution=args.image_resolution, 
-                                    embedding_dim=args.embedding_dim, embedding_shape=(args.embedding_shape, args.embedding_shape),
-                                    include_pos_embed=args.include_pos_embed, patch_size=args.patch_size, num_patches=args.num_patches,
-                                    slot_attn_heads=args.slot_attn_heads, decoder_blocks=args.decoder_blocks, decoder_heads=args.decoder_heads, 
-                                    decoder_dim=args.decoder_dim, autoregressive=args.autoregressive, label_smoothing=args.label_smoothing)
+                                    encoder=encoder)
 
 
 wandb_logger = WandbLogger(
@@ -180,132 +173,3 @@ trainer = Trainer(
 torch.set_float32_matmul_precision('medium')
 
 trainer.fit(model=model, datamodule=data)
-
-# saved_model = ViTAE.load_from_checkpoint('/vol/bitbucket/bc1623/project/semi_supervised_uncertainty/bash_scripts/lightning_logs/chestxray_mae/chestxray_mae/gn9nzdz8/checkpoints/epoch=503-step=95256.ckpt',
-#     model_kwargs={
-#         'img_size': 224,
-#         'embed_dim': 768,
-#         'in_chans': 1,
-#         'num_heads': 12,
-#         'depth': 12,
-#         'decoder_embed_dim': 512,
-#         'decoder_depth': 8,
-#         'decoder_num_heads': 16,
-#         'norm_layer': partial(nn.LayerNorm, eps=1e-6),
-#         'mlp_ratio': 4.0,
-#         'patch_size': 16,
-#         'norm_pix_loss': False,
-#     },
-#     learning_rate=1e-4,
-#     map_location=torch.device('cpu'),
-#     )
-
-# # resnet34 = ResNet34_8x8(get_resnet34_encoder())         # output is shape (batch_size, 256, 8, 8)
-
-# dinovit = DinoViT_16()
-
-# oss = ObjectSpecificSegmentation(dinovit, num_slots=5, num_iterations=3, num_classes=4, slot_dim=64, task='recon', decoder_type='transformer', 
-#                                  learning_rate=2e-4, freeze_encoder=True, temperature=1, log_images=True, lr_warmup=True, include_seg_loss=False,
-#                                  slot_attn_type='probabilistic', image_chans=1, image_resolution=224, embedding_dim=384,
-#                                  embedding_shape=(14, 14), include_mlp=True, include_pos_embed=False, patch_size=16, num_patches=14*14,
-#                                  slot_attn_heads=2, decoder_blocks=4, decoder_heads=8, decoder_dim=256, label_smoothing=0.0,
-#                                  autoregressive=True)
-
-# # data = JSRTDataModule(data_dir='/vol/bitbucket/bc1623/project/semi_supervised_uncertainty/data/JSRT/', batch_size=128, augmentation=False)
-# data = CheXpertDataModule(data_dir='/vol/biodata/data/chest_xray/CheXpert-v1.0/preproc_224x224/', batch_size=128, cache=True, augmentation=False)
-
-# wandb_logger = WandbLogger(save_dir='/vol/bitbucket/bc1623/project/runs/lightning_logs/probabilistic_seg/', project='probabilistic_seg',
-#                            name='fixed_autor', id='fixed_autor', offline=False)
-# output_dir = Path(f"probabilistic_seg/run_{wandb_logger.experiment.id}")  # type: ignore
-# print("Saving to" + str(output_dir.absolute()))
-
-# resnet34_8x8 = ResNet34_8x8(get_resnet34_encoder())         # output is shape (batch_size, 256, 8, 8)
-
-# dino_vit = DinoViT_16()
-# oss = ObjectSpecificSegmentation(dino_vit, num_slots=6, num_iterations=3, num_classes=4, slot_dim=32, task='recon', decoder_type='shared', 
-#                                 learning_rate=4e-4, freeze_encoder=False, temperature=1, log_images=True, lr_warmup=True, include_seg_loss=True,
-#                                 slot_attn_type='probabilistic', image_chans=1, image_resolution=128, embedding_dim=384,
-#                                 embedding_shape=(8, 8), include_pos_embed=False, include_mlp=True, patch_size=16, num_patches=8*8,
-#                                 slot_attn_heads=4, decoder_blocks=4, decoder_heads=8, decoder_dim=128, label_smoothing=0.0)
-
-# data = SynthCardDataModule(batch_size=64, rate_maps=1.0)
-
-# wandb_logger = WandbLogger(save_dir='./runs/lightning_logs/synthetic_cardiac/', project='synthetic_cardiac',
-#                            name='dino_cnn_seg_1', id='dino_cnn_seg_1', offline=False)
-# output_dir = Path(f"synthetic_cardiac/run_{wandb_logger.experiment.id}")  # type: ignore
-# print("Saving to" + str(output_dir.absolute()))
-
-# saved_model = ViTAE.load_from_checkpoint('/vol/bitbucket/bc1623/project/semi_supervised_uncertainty/bash_scripts/lightning_logs/abdomin_mae/abdomin_mae/abdomin_mae_7/checkpoints/epoch=215-step=24408.ckpt',
-#      model_kwargs={
-#         'img_size': 512,
-#         'embed_dim': 768,
-#         'in_chans': 1,
-#         'num_heads': 12,
-#         'depth': 12,
-#         'decoder_embed_dim': 512,
-#         'decoder_depth': 8,
-#         'decoder_num_heads': 16,
-#         'norm_layer': partial(nn.LayerNorm, eps=1e-6),
-#         'mlp_ratio': 4.0,
-#         'patch_size': 16,
-#         'norm_pix_loss': False,
-#     },
-#     learning_rate=1e-4,
-#      map_location=torch.device('cpu'),
-# )
-
-# dinovit = DinoViT_16()
-# # dinov2vit = Dinov2ViT_14()
-# # # 32 batch size
-# oss = ObjectSpecificSegmentation(encoder=dinovit, num_slots=8, num_iterations=3, num_classes=4, slot_dim=64, task='recon', decoder_type='shared', 
-#                                  learning_rate=2e-4, freeze_encoder=True, temperature=1, log_images=True, lr_warmup=True, include_seg_loss=True,
-#                                  slot_attn_type='probabilistic', image_chans=1, image_resolution=512, embedding_dim=384,
-#                                  embedding_shape=(32, 32), include_mlp=True, include_pos_embed=False, patch_size=16, num_patches=32*32,
-#                                  slot_attn_heads=4, decoder_blocks=6, decoder_heads=8, decoder_dim=256, label_smoothing=0.0,
-#                                  autoregressive=False)
-
-# wandb_logger = WandbLogger(save_dir='./runs/lightning_logs/abd_seg/', project='abd_seg',
-#                            name='cnn_add_seg_3', id='cnn_add_seg_3', offline=False)
-# output_dir = Path(f"abd_seg/run_{wandb_logger.experiment.id}")  # type: ignore
-# print("Saving to" + str(output_dir.absolute()))
-
-# data = CURVASDataModule(batch_size=32, cache=True, augmentation=False)
-
-# resnet34 = ResNet34_8x8(get_resnet34_encoder())
-# dinovit = DinoViT_16()
-# # dinov2vit = Dinov2ViT_14()
-# #64 batch size
-# model = ObjectSpecificSegmentation(dinovit, num_slots=8, num_iterations=3, num_classes=4, slot_dim=64, task='recon', decoder_type='transformer', 
-#                                  learning_rate=2e-4, freeze_encoder=True, temperature=1, log_images=True, lr_warmup=True, include_seg_loss=True,
-#                                  slot_attn_type='probabilistic', image_chans=1, image_resolution=512, embedding_dim=384,
-#                                  embedding_shape=(32, 32), include_mlp=True, include_pos_embed=False, patch_size=16, num_patches=32*32,
-#                                  slot_attn_heads=4, decoder_blocks=6, decoder_heads=8, decoder_dim=256, label_smoothing=0.0,
-#                                  autoregressive=False)
-
-# wandb_logger = WandbLogger(save_dir='./runs/lightning_logs/abd_seg/', project='abd_seg',
-#                            name='add_seg_3', id='add_seg_3', offline=False)
-# output_dir = Path(f"abd_seg/run_{wandb_logger.experiment.id}")  # type: ignore
-# print("Saving to" + str(output_dir.absolute()))
-
-# data = CURVASDataModule(batch_size=12, cache=True)
-
-
-# trainer = Trainer(
-#     max_epochs=50000,
-#     precision='16-mixed',
-#     accelerator='auto',
-#     devices=[0, 1],
-#     strategy='ddp_find_unused_parameters_true',
-#     # accumulate batches
-#     #accumulate_grad_batches=2,
-#     log_every_n_steps=250,
-#     #val_check_interval=0.5,
-#     check_val_every_n_epoch=10,
-#     progress_bar_refresh_rate=100,
-#     logger=wandb_logger,
-#     callbacks=[ModelCheckpoint(monitor="val_loss", mode='min'), TQDMProgressBar(refresh_rate=20)],
-# )
-
-# torch.set_float32_matmul_precision('medium')
-
-# trainer.fit(model=model, datamodule=data)

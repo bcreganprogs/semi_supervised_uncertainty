@@ -307,195 +307,6 @@ class FixedSlotAttentionMultiHead(torch.nn.Module):
 
         return slots, attn_vis
     
-# class FixedSlotAttentionMultiHeadProb(torch.nn.Module):
-#     """Implementation of Probabalistic Slot Attention from Identifiable Object-Centric Representation Learning
-#     via Probabilistic Slot Attention by Kori et al. 2024."""
-#     def __init__(self, num_slots: int, dim: int, num_iterations: int, num_heads: int = 1, hidden_dim: int = 256, temperature: float = 1, probabalistic: bool = False):
-#         super(FixedSlotAttentionMultiHeadProb, self).__init__()
-#         self.num_slots = num_slots
-#         self.num_iterations = num_iterations
-#         self.dim = dim
-#         self.num_heads = num_heads
-#         self.scale = dim ** -0.5
-#         self.temperature = temperature
-#         self.probabalistic = probabalistic
-#         self.eps = 1e-5
-
-#         self.slots_mu = nn.Parameter(torch.zeros(1, self.num_slots, dim))
-#         init.xavier_uniform_(self.slots_mu)
-#         self.slots_logsigma = nn.Parameter(torch.zeros(1, self.num_slots, dim))
-#         init.xavier_uniform_(self.slots_logsigma)
-
-#         # learnable weights
-#         self.mixing_coeffs = nn.Parameter(1/self.num_slots * torch.ones(1, self.num_slots), requires_grad=False)  # shape (1, K)
-#         self.to_keys = nn.Parameter(torch.rand(self.num_slots, self.dim, self.dim))      # from inputs
-#         self.to_queries = nn.Parameter(torch.rand(self.num_slots, self.dim, self.dim))   # from slots
-#         self.to_values = nn.Parameter(torch.rand(self.num_slots, self.dim, self.dim))    # from inputs
-
-#         self.gru = nn.GRUCell(dim, dim)
-
-#         hidden_dim = max(dim, hidden_dim)
-
-#         self.mlp = nn.Sequential(
-#             nn.Linear(dim, hidden_dim),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim, dim)
-#         )
-
-#         self.layer_norm_inputs = nn.LayerNorm(dim)
-#         self.layer_norm_slots = nn.LayerNorm(dim)
-#         self.layer_norm_pre_ff = nn.LayerNorm(dim)
-    
-#     def forward(self, embeddings: torch.Tensor):
-#         """Slot Attention """
-#         B, N, D = embeddings.shape
-#         # 1) initialise the slots 
-#         mu = self.slots_mu.expand(B, -1, -1)
-#         sigma = self.slots_logsigma.exp().expand(B, -1, -1)
-#         slots = mu + sigma * torch.randn(mu.shape, device=embeddings.device)
-#         mixing_coeffs = self.mixing_coeffs.expand(B, -1).unsqueeze(2)  # shape (B, K, 1)
-        
-#         embeddings = self.layer_norm_inputs(embeddings)
-#         keys = torch.einsum("bne,ked->bknd", embeddings, self.to_keys).view(B, self.num_slots, N, self.num_heads, self.dim // self.num_heads)
-#         values = torch.einsum("bne,ked->bknd", embeddings, self.to_values).view(B, self.num_slots, N, self.num_heads, self.dim // self.num_heads)
-        
-#         for _ in range(self.num_iterations):
-#             slots_prev = slots
-#             slots = self.layer_norm_slots(slots) # shape (B, K, D)
-            
-#             # attention = mixture coefficients * likelihood of gaussian / sum of mixture coefficients * likelihood of gaussian
-#             # Bishop Pattern Recognition and Machine Learning page 78
-#             # find likelihood of keys under normal given by queries and sigma
-#             queries = torch.einsum('bkd,kdd->bkd', slots, self.to_queries).view(B, self.num_slots, self.num_heads, self.dim // self.num_heads)    # shape (B, K, H, D/H)
-    	    
-#             exponent = -0.5 * (keys - queries.unsqueeze(2))**2 / (sigma.unsqueeze(2)**2 + self.eps)     # shape (B, K, N)
-#             log_pi = -0.5 * D * torch.log(torch.tensor(2*torch.pi))                                     # shape (1)
-#             log_scale = - torch.log(torch.clamp(sigma, min=self.eps)).unsqueeze(2)                      # shape (B, K, 1, D)
-          
-#             gaussian_log_likelihood = torch.log(mixing_coeffs + self.eps) + (log_pi + log_scale + exponent).sum(dim=-1)  # shape (B, K, N)
-      
-#             attn = F.softmax(gaussian_log_likelihood, dim=1) + self.eps                                 # shape (B, K, N)
-       
-#             attn_vis = attn
-
-#             Nk = attn.sum(dim=2, keepdim=True)  # shape (B, K, 1)
-#             slot_updates = (1 / Nk + self.eps) * torch.sum(attn.unsqueeze(-1) * values, dim=2)
-#             #slot_updates = torch.einsum('bknd,bkn->bkd', values, attn)  # shape (B, K, D)
-            
-#             #var = torch.einsum('bknd,bkn->bkd', (values - slot_updates.unsqueeze(2))**2, attn)  # shape (B, K, D)
-#             #sigma = torch.sqrt(var)
-#             new_queries = torch.einsum('bkd,kdd->bkd', slot_updates, self.to_queries)
-#             sigma = (1 / Nk) * torch.sum(attn.unsqueeze(-1) * (keys - new_queries.unsqueeze(2))**2, dim=2)  # shape (B, K, D)
-#             sigma = torch.sqrt(sigma) + self.eps  # shape (B, K, D)
-            
-#             mixing_coeffs = Nk / N  # update mixing coefficients
-            
-#             # 5) GRU to update slots
-#             slots = self.gru(slot_updates.reshape(-1, D), slots_prev.reshape(-1, D))
-
-#             slots = slots.reshape(B, -1, D)
-#             slots = slots + self.mlp(self.layer_norm_pre_ff(slots)) # shape (B, K, D)
-            
-#         # sample from slotwise distributions
-#         slots = slots + sigma * torch.randn_like(slots)
-        
-#         return slots, attn_vis
-
-# class FixedSlotAttentionMultiHeadProb(torch.nn.Module):
-#     """Implementation of Probabalistic Slot Attention from Identifiable Object-Centric Representation Learning
-#     via Probabilistic Slot Attention by Kori et al. 2024."""
-#     def __init__(self, num_slots: int, dim: int, num_iterations: int, num_heads: int = 4, hidden_dim: int = 256, temperature: float = 1, probabalistic: bool = False):
-#         super(FixedSlotAttentionMultiHeadProb, self).__init__()
-#         self.num_slots = num_slots
-#         self.num_iterations = num_iterations
-#         self.dim = dim
-#         self.num_heads = num_heads
-#         self.scale = dim ** -0.5
-#         self.temperature = temperature
-#         self.probabalistic = probabalistic
-#         self.eps = 1e-5
-
-#         self.slots_mu = nn.Parameter(torch.zeros(1, self.num_slots, dim))
-#         init.xavier_uniform_(self.slots_mu)
-#         self.slots_logsigma = nn.Parameter(torch.zeros(1, self.num_slots, dim))
-#         init.xavier_uniform_(self.slots_logsigma)
-
-#         # learnable weights
-#         self.mixing_coeffs = nn.Parameter(1/self.num_slots * torch.ones(1, self.num_slots), requires_grad=False)  # shape (1, K)
-#         self.to_keys = nn.Parameter(torch.rand(self.num_slots, self.dim, self.dim))      # from inputs
-#         self.to_queries = nn.Parameter(torch.rand(self.num_slots, self.dim, self.dim))   # from slots
-#         self.to_values = nn.Parameter(torch.rand(self.num_slots, self.dim, self.dim))    # from inputs
-
-#         self.gru = nn.GRUCell(dim, dim)
-
-#         hidden_dim = max(dim, hidden_dim)
-
-#         self.mlp = nn.Sequential(
-#             nn.Linear(dim, hidden_dim),
-#             nn.ReLU(),
-#             nn.Linear(hidden_dim, dim)
-#         )
-
-#         self.layer_norm_inputs = nn.LayerNorm(dim)
-#         self.layer_norm_slots = nn.LayerNorm(dim)
-#         self.layer_norm_pre_ff = nn.LayerNorm(dim)
-    
-#     def forward(self, embeddings: torch.Tensor):
-#         """Slot Attention """
-#         B, N, D = embeddings.shape
-#         # 1) initialise the slots 
-#         mu = self.slots_mu.expand(B, -1, -1)
-#         sigma = self.slots_logsigma.exp().expand(B, -1, -1)
-#         slots = mu + sigma * torch.randn(mu.shape, device=embeddings.device)
-#         mixing_coeffs = self.mixing_coeffs.expand(B, -1).unsqueeze(2)  # shape (B, K, 1)
-        
-#         embeddings = self.layer_norm_inputs(embeddings)
-#         keys = torch.einsum("bne,ked->bknd", embeddings, self.to_keys).view(B, self.num_slots, N, self.num_heads, self.dim // self.num_heads) # shape (B, K, N, H, D/H)
-#         values = torch.einsum("bne,ked->bknd", embeddings, self.to_values).view(B, self.num_slots, N, self.num_heads, self.dim // self.num_heads) # shape (B, K, N, H, D/H)
-#         sigma = sigma.view(B, self.num_slots, self.num_heads, self.dim // self.num_heads)
-        
-#         for _ in range(self.num_iterations):
-#             slots_prev = slots
-#             slots = self.layer_norm_slots(slots) # shape (B, K, D)
-            
-#             # attention = mixture coefficients * likelihood of gaussian / sum of mixture coefficients * likelihood of gaussian
-#             # Bishop Pattern Recognition and Machine Learning page 78
-#             # find likelihood of keys under normal given by queries and sigma
-#             queries = torch.einsum('bkd,kdd->bkd', slots, self.to_queries).view(B, self.num_slots, self.num_heads, self.dim // self.num_heads)    # shape (B, K, H, D/H)
-#     	    # sigma shape B, K, D, query shape B, K, H, D/H, keys shape B, K, N, H, D/H
-#             exponent = -0.5 * (keys - queries.unsqueeze(2))**2 / (sigma.unsqueeze(2)**2 + self.eps)     # shape (B, K, N)
-#             log_pi = -0.5 * D * torch.log(torch.tensor(2*torch.pi))                                     # shape (1)
-#             log_scale = - torch.log(torch.clamp(sigma, min=self.eps)).unsqueeze(2)                      # shape (B, K, 1, D)
-       
-#             gaussian_log_likelihood = torch.log(mixing_coeffs + self.eps).unsqueeze(-1) + (log_pi + log_scale + exponent).sum(dim=-1) * self.scale  # shape (B, K, N)
-      
-#             attn = F.softmax(gaussian_log_likelihood, dim=1) + self.eps                              # shape (B, K, N, H)
-   
-#             attn_vis = attn.sum(-1)
-
-#             Nk = attn.sum(dim=2, keepdim=True)  # shape (B, K, 1, H)
-#             Nk = Nk.permute(0, 1, 3, 2)  # shape (B, K, H, 1)
-  
-#             slot_updates = torch.einsum('bknh,bknhu->bkhu', attn, values)   # shape (B, K, H, D/H)
-#             slot_updates = (1 / Nk + self.eps) * slot_updates  # shape (B, K, H, D/H)     
-
-#             sigma = torch.sum(attn.unsqueeze(-1) * (values - slot_updates.unsqueeze(2))**2, dim=2) # shape (B, K, H, D/H)
-#             sigma = (1 / Nk + self.eps) * sigma  # shape (B, K, D)
-#             sigma = torch.sqrt(sigma) + self.eps # shape (B, K, D)
-            
-#             mixing_coeffs = Nk.sum(-2) / N  # update mixing coefficients
-            
-#             # 5) GRU to update slots
-#             slots = self.gru(slot_updates.reshape(-1, D), slots_prev.reshape(-1, D))
-
-#             slots = slots.reshape(B, self.num_slots, D)
-#             slots = slots + self.mlp(self.layer_norm_pre_ff(slots)) # shape (B, K, D)
-            
-#         sigma = sigma.view(B, self.num_slots, self.dim)
-#         # sample from slotwise distributions
-#         slots = slots + sigma * torch.randn_like(slots)
-        
-#         return slots, attn_vis
 
 class FixedSlotAttentionMultiHeadProb(torch.nn.Module):
     """Implementation of Probabalistic Slot Attention from Identifiable Object-Centric Representation Learning
@@ -538,17 +349,13 @@ class FixedSlotAttentionMultiHeadProb(torch.nn.Module):
         self.layer_norm_inputs = nn.LayerNorm(input_dim)
         self.layer_norm_slots = nn.LayerNorm(slot_dim)
         self.layer_norm_pre_ff = nn.LayerNorm(slot_dim)
+
+        self.training = True
     
     def forward(self, embeddings: torch.Tensor):
         """Slot Attention """
         B, N, D = embeddings.shape
-        # 1) initialise the slots 
-        # if self.training:
-        #     sigma = self.train_sigma.exp().expand(B, self.num_slots, -1)
-        #     slots = self.train_mu + self.train_sigma.exp() * torch.randn(
-        #         B, self.num_slots, self.slot_dim, device=embeddings.device
-        #     )
-        # else:
+
         mu = self.slots_mu.repeat(B, 1, 1)
         slots = mu + self.mu_scale.exp() * torch.randn(mu.shape, device=embeddings.device)
 
@@ -608,7 +415,7 @@ class FixedSlotAttentionMultiHeadProb(torch.nn.Module):
             
         sigma = sigma.view(B, self.num_slots, self.slot_dim)
         # sample from slotwise distributions
-        if self.posterior_sample:
+        if self.posterior_sample and self.training:
             slots = slots + sigma * torch.randn_like(slots)
         
-        return slots, attn_vis, values.detach()
+        return slots, attn_vis

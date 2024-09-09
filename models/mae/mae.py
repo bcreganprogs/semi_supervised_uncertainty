@@ -79,6 +79,7 @@ class VisionTransformer(nn.Module):
                  decoder_num_heads=16,
                  mlp_ratio=4.,
                  norm_layer=nn.LayerNorm,
+                 mask_ratio=0.0,
                  norm_pix_loss=False):
         super().__init__()
 
