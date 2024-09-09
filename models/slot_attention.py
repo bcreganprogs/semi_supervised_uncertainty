@@ -332,7 +332,7 @@ class FixedSlotAttentionMultiHeadProb(torch.nn.Module):
 
         # learnable weights
         self.mixing_coeffs = nn.Parameter(1/self.num_slots * torch.ones(1, self.num_slots), requires_grad=False)  # shape (1, K)
-        self.to_keys = nn.Parameter(torch.rand(self.input_dim, self.slot_dim))      # from inputs
+        self.to_keys = nn.Parameter(torch.rand(self.num_slots, self.input_dim, self.slot_dim))      # from inputs
         self.to_queries = nn.Parameter(torch.rand(self.num_slots, self.slot_dim, self.slot_dim))   # from slots
         self.to_values = nn.Parameter(torch.rand(self.input_dim, self.slot_dim))    # from inputs
 
@@ -364,7 +364,7 @@ class FixedSlotAttentionMultiHeadProb(torch.nn.Module):
         mixing_coeffs = self.mixing_coeffs.expand(B, -1).unsqueeze(2)  # shape (B, K, 1)
         
         embeddings = self.layer_norm_inputs(embeddings)
-        keys = torch.einsum("bne,ed->bnd", embeddings, self.to_keys).view(B, N, self.num_heads, self.slot_dim // self.num_heads) # shape (B, N, H, D/H)
+        keys = torch.einsum("bne,ked->bknd", embeddings, self.to_keys).view(B, self.num_slots, N, self.num_heads, self.slot_dim // self.num_heads) # shape (B, K, N, H, D/H)
         values = torch.einsum("bne,ed->bnd", embeddings, self.to_values).view(B, N, self.num_heads, self.slot_dim // self.num_heads) # shape (B, K, N, H, D/H)
    
         for _ in range(self.num_iterations):
